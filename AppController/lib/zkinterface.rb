@@ -682,14 +682,30 @@ class ZKInterface
 
 
   def self.delete(key)
-    Djinn.log_debug("[ZK] trying to delete #{key}")
-    info = self.run_zookeeper_operation {
-      @@zk.delete(:path => key)
-    }
-    if !info[:rc].zero?
-      Djinn.log_debug("Delete failed - #{info.inspect}")
-      raise FailedZooKeeperOperationException.new("Failed to delete " +
-        " path #{key}, saw info #{info.inspect}")
+    retries_left = 5
+    begin
+      Djinn.log_debug("[ZK] trying to delete #{key}")
+      info = self.run_zookeeper_operation {
+        @@zk.delete(:path => key)
+      }
+      if !info[:rc].zero?
+        Djinn.log_debug("Delete failed - #{info.inspect}")
+        raise FailedZooKeeperOperationException.new("Failed to delete " +
+          " path #{key}, saw info #{info.inspect}")
+      end
+    rescue FailedZooKeeperOperationException => e
+      retries_left -= 1
+      Djinn.log_debug("Saw a failure trying to write to ZK, with " +
+        "info [#{e}]")
+      if retries_left > 0
+        Djinn.log_debug("Retrying delete operation, with #{retries_left}" +
+          " retries left")
+        Kernel.sleep(5)
+        retry
+      else
+        Djinn.log_debug("[ERROR] Failed to delete from ZK and no retries " +
+          "left. Skipping on this delete for now.")
+      end
     end
 
     Djinn.log_debug("Delete succeeded!")
