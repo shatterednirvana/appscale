@@ -354,6 +354,36 @@ module HelperFunctions
     return bound_addrs
   end
 
+
+  def self.get_private_host_from_metadata(ec2_url)
+    get_host_cmd = "curl http://BOO/latest/meta-data/local-hostname"
+
+    # In Amazon EC2 and Eucalyptus (MANAGED or MANAGED-NOVLAN), the
+    # metadata service can be found at 169.254.169.254, so try there
+    # first.
+    get_host_in_ec2 = get_host_cmd.gsub(/BOO/, '169.254.169.254')
+    localhost = HelperFunctions.shell(get_host_in_ec2)
+    if !localhost.empty?
+      return localhost
+    end
+
+    # If that didn't work, then we may be in Eucalyptus (STATIC) or
+    # Eucalyptus (SYSTEM), where the metadata service is located at
+    # the CLC's IP address.
+    clc_ip = ec2_url.scan(/\/\/(.*)\:/).flatten.to_s
+    get_host_in_euca = get_host_cmd.gsub(/BOO/, clc_ip)
+    localhost = HelperFunctions.shell(get_host_in_euca)
+    if !localhost.empty?
+      return localhost
+    end
+
+    # If neither of those worked, we're out of options, so throw up
+    # and die here.
+    raise AppScaleException.new("Couldn't get our hostname from the " +
+      "metadata service. Tried contacting both 169.254.169.254 and " +
+      "#{clc_ip}, which failed.")
+  end
+
   
   # Sets the locally cached IP address to the provided value. Callers
   # should use this if they believe the IP address on this machine

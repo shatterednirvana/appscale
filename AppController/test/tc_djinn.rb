@@ -12,12 +12,14 @@ class TestDjinn < Test::Unit::TestCase
   def setup
     kernel = flexmock(Kernel)
     kernel.should_receive(:puts).and_return()
-    kernel.should_receive(:shell).with("").and_return()
     kernel.should_receive(:sleep).and_return()
 
-    djinn_class = flexmock(Djinn)
-    djinn_class.should_receive(:log_debug).and_return()
-    djinn_class.should_receive(:log_run).and_return()
+    djinn = flexmock(Djinn)
+    djinn.should_receive(:log_debug).and_return()
+    djinn.should_receive(:log_run).and_return()
+
+    helperfunctions = flexmock(HelperFunctions)
+    helperfunctions.should_receive(:shell).with("").and_return()
 
     @secret = "baz"
     flexmock(HelperFunctions).should_receive(:read_file).
@@ -143,13 +145,13 @@ class TestDjinn < Test::Unit::TestCase
     one_node_info = ['public_ip:private_ip:some_role:instance_id:cloud1']
     app_names = []
 
-    udpsocket = flexmock(UDPSocket)
-    udpsocket.should_receive(:open).and_return("not any ips above")
+    flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
+      and_return("not any ips above")
 
-    expected_2 = "Error: Couldn't find me in the node map"
-    result_6 = djinn.set_parameters(one_node_info, credentials, app_names,
-      @secret)
-    assert_equal(expected_2, result_6)
+    assert_raises(AppScaleException) {
+      djinn.set_parameters(one_node_info, credentials, app_names,
+        @secret)
+    }
   end
 
   def test_set_params_w_good_params
@@ -382,8 +384,8 @@ class TestDjinn < Test::Unit::TestCase
     baz.should_receive(:set).with(:path => done_loading,
       :data => JSON.dump(true)).and_return(all_ok)
 
-    flexmock(HelperFunctions).should_receive(:local_ip).
-      and_return("private_ip")
+    flexmock(HelperFunctions).should_receive(:get_all_local_ips).
+      and_return(["private_ip"])
 
     flexmock(GodInterface).should_receive(:start).and_return()
 
@@ -636,6 +638,77 @@ class TestDjinn < Test::Unit::TestCase
     }
 
     assert_equal(2, boo)
+  end
+
+  def test_find_me_in_locations_via_metadata_service_euca_managed
+    # in Eucalyptus, we may be given a public / private DNS that
+    # does not match, so the AppController should query the metadata
+    # service to get the private DNS that matches its VM
+
+    flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
+      and_return("private_ip")
+    flexmock(HelperFunctions).should_receive(:shell).
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
+      and_return("private_dns")
+
+    djinn = Djinn.new()
+    my_role = "public_dns:private_dns:open:instance_id:cloud1"
+    djinn.nodes = [DjinnJobData.new(my_role, "bazscale")]
+    djinn.creds = {
+      'infrastructure' => 'euca',
+      'ec2_url' => 'http://euca-url.boo:8773/services/Eucalyptus'
+    }
+    assert_equal("private_dns", djinn.find_me_in_locations())
+  end
+
+  def test_find_me_in_locations_via_metadata_service_euca_system
+    # in Eucalyptus, we may be given a public / private DNS that
+    # does not match, so the AppController should query the metadata
+    # service to get the private DNS that matches its VM
+
+    flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
+      and_return("private_ip")
+    flexmock(HelperFunctions).should_receive(:shell).
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
+      and_return("")
+    flexmock(HelperFunctions).should_receive(:shell).
+      with("curl http://euca-url.boo/latest/meta-data/local-hostname").
+      and_return("private_dns")
+
+    djinn = Djinn.new()
+    my_role = "public_dns:private_dns:open:instance_id:cloud1"
+    djinn.nodes = [DjinnJobData.new(my_role, "bazscale")]
+    djinn.creds = {
+      'infrastructure' => 'euca',
+      'ec2_url' => 'http://euca-url.boo:8773/services/Eucalyptus'
+    }
+    assert_equal("private_dns", djinn.find_me_in_locations())
+  end
+
+  def test_find_me_in_locations_via_metadata_service_euca_broken
+    # in Eucalyptus, we may be given a public / private DNS that
+    # does not match, so the AppController should query the metadata
+    # service to get the private DNS that matches its VM
+
+    flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
+      and_return("private_ip")
+    flexmock(HelperFunctions).should_receive(:shell).
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
+      and_return("")
+    flexmock(HelperFunctions).should_receive(:shell).
+      with("curl http://euca-url.boo/latest/meta-data/local-hostname").
+      and_return("")
+
+    djinn = Djinn.new()
+    my_role = "public_dns:private_dns:open:instance_id:cloud1"
+    djinn.nodes = [DjinnJobData.new(my_role, "bazscale")]
+    djinn.creds = {
+      'infrastructure' => 'euca',
+      'ec2_url' => 'http://euca-url.boo:8773/services/Eucalyptus'  
+    }
+    assert_raises(AppScaleException) {
+      djinn.find_me_in_locations()
+    }
   end
 
 end

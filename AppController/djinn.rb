@@ -1832,11 +1832,18 @@ class Djinn
  
   # Searches through @nodes to try to find out which node is ours. Strictly
   # speaking, we assume that our node is identifiable by private IP.
+  # Returns:
+  #   The private IP or DNS address associated with this VM.
   def find_me_in_locations()
     @my_index = nil
     all_local_ips = HelperFunctions.get_all_local_ips()
     Djinn.log_debug("Seeing which node has a private IP that matches " +
       "our private IPs, which are: #{all_local_ips.join(', ')}")
+    if is_cloud?  # then also query the metadata service for our IP
+      all_local_ips << HelperFunctions.get_private_host_from_metadata(
+        @creds['ec2_url'])
+    end
+
     Djinn.log_debug("@nodes is #{@nodes.join(', ')}")
     @nodes.each_index { |index|
       Djinn.log_debug("Am I #{@nodes[index].private_ip}?")
@@ -1844,11 +1851,15 @@ class Djinn
         Djinn.log_debug("Yes!")
         @my_index = index
         HelperFunctions.set_local_ip(@nodes[index].private_ip)
-        return
+        return @nodes[index].private_ip
       end
       Djinn.log_debug("No...")
     }
+
     Djinn.log_debug("I am lost, could not find my node") 
+    raise AppScaleException.new("Could not resolve my node's private " +
+      "IP address to any of the following local IPs: " +
+      "#{all_local_ips.join(', ')}")
   end
 
 
