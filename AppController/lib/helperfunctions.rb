@@ -355,15 +355,27 @@ module HelperFunctions
   end
 
 
+  # Contacts the metadata service (which runs in Amazon EC2 and
+  # Eucalyptus) to receive this VM's local hostname. Should not be
+  # used outside of these clouds, where there is no such service.
+  # Args:
+  #   ec2_url: The EC2_URL environment variable, which points to the
+  #     IP or DNS address where the metadata service runs.
+  # Returns:
+  #   The private hostname (IP or DNS) corresponding to this machine.
+  # Raises:
+  #   AppScaleException: If this method is unable to determine the
+  #     hostname of this machine via the metadata service.
   def self.get_private_host_from_metadata(ec2_url)
-    get_host_cmd = "curl http://BOO/latest/meta-data/local-hostname"
+    get_host_cmd = "curl http://BOO/latest/meta-data/local-hostname; echo $?"
 
     # In Amazon EC2 and Eucalyptus (MANAGED or MANAGED-NOVLAN), the
     # metadata service can be found at 169.254.169.254, so try there
     # first.
     get_host_in_ec2 = get_host_cmd.gsub(/BOO/, '169.254.169.254')
-    localhost = HelperFunctions.shell(get_host_in_ec2)
-    if !localhost.empty?
+    localhost, return_val = HelperFunctions.shell(get_host_in_ec2).
+      split("\n")
+    if Integer(return_val).zero?
       return localhost
     end
 
@@ -372,8 +384,9 @@ module HelperFunctions
     # the CLC's IP address.
     clc_ip = ec2_url.scan(/\/\/(.*)\:/).flatten.to_s
     get_host_in_euca = get_host_cmd.gsub(/BOO/, "#{clc_ip}:8773")
-    localhost = HelperFunctions.shell(get_host_in_euca)
-    if !localhost.empty?
+    localhost, return_val = HelperFunctions.shell(get_host_in_euca).
+      split("\n")
+    if Integer(return_val).zero?
       return localhost
     end
 

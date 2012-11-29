@@ -648,8 +648,9 @@ class TestDjinn < Test::Unit::TestCase
     flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
-      and_return("private_dns")
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
+        "; echo $?").
+      and_return("private_dns\n0")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
@@ -669,11 +670,12 @@ class TestDjinn < Test::Unit::TestCase
     flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
-      and_return("")
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
+        "; echo $?").
+      and_return("\n1")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname").
-      and_return("private_dns")
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo $?").
+      and_return("private_dns\n0")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
@@ -693,11 +695,12 @@ class TestDjinn < Test::Unit::TestCase
     flexmock(HelperFunctions).should_receive(:shell).with("ifconfig").
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://169.254.169.254/latest/meta-data/local-hostname").
-      and_return("")
+      with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
+        "; echo $?").
+      and_return("\n1")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname").
-      and_return("")
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo $?").
+      and_return("\n255")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
