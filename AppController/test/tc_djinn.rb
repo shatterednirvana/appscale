@@ -672,7 +672,7 @@ class TestDjinn < Test::Unit::TestCase
       with("curl http://169.254.169.254/latest/meta-data/local-hostname").
       and_return("")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo/latest/meta-data/local-hostname").
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname").
       and_return("private_dns")
 
     djinn = Djinn.new()
@@ -696,7 +696,7 @@ class TestDjinn < Test::Unit::TestCase
       with("curl http://169.254.169.254/latest/meta-data/local-hostname").
       and_return("")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo/latest/meta-data/local-hostname").
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname").
       and_return("")
 
     djinn = Djinn.new()

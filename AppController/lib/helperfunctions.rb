@@ -371,7 +371,7 @@ module HelperFunctions
     # Eucalyptus (SYSTEM), where the metadata service is located at
     # the CLC's IP address.
     clc_ip = ec2_url.scan(/\/\/(.*)\:/).flatten.to_s
-    get_host_in_euca = get_host_cmd.gsub(/BOO/, clc_ip)
+    get_host_in_euca = get_host_cmd.gsub(/BOO/, "#{clc_ip}:8773")
     localhost = HelperFunctions.shell(get_host_in_euca)
     if !localhost.empty?
       return localhost
