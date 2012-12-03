@@ -367,7 +367,7 @@ module HelperFunctions
   #   AppScaleException: If this method is unable to determine the
   #     hostname of this machine via the metadata service.
   def self.get_private_host_from_metadata(ec2_url)
-    get_host_cmd = "curl http://BOO/latest/meta-data/local-hostname; echo $?"
+    get_host_cmd = "curl http://BOO/latest/meta-data/local-hostname; echo '\n' $?"
 
     # In Amazon EC2 and Eucalyptus (MANAGED or MANAGED-NOVLAN), the
     # metadata service can be found at 169.254.169.254, so try there

@@ -649,8 +649,8 @@ class TestDjinn < Test::Unit::TestCase
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
       with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
-        "; echo $?").
-      and_return("private_dns\n0")
+        "; echo '\n' $?").
+      and_return("private_dns\n0\n")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
@@ -671,11 +671,11 @@ class TestDjinn < Test::Unit::TestCase
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
       with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
-        "; echo $?").
-      and_return("\n1")
+        "; echo '\n' $?").
+      and_return("\n1\n")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo $?").
-      and_return("private_dns\n0")
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo '\n' $?").
+      and_return("private_dns\n0\n")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
@@ -696,11 +696,11 @@ class TestDjinn < Test::Unit::TestCase
       and_return("private_ip")
     flexmock(HelperFunctions).should_receive(:shell).
       with("curl http://169.254.169.254/latest/meta-data/local-hostname" +
-        "; echo $?").
-      and_return("\n1")
+        "; echo '\n' $?").
+      and_return("\n1\n")
     flexmock(HelperFunctions).should_receive(:shell).
-      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo $?").
-      and_return("\n255")
+      with("curl http://euca-url.boo:8773/latest/meta-data/local-hostname; echo '\n' $?").
+      and_return("\n255\n")
 
     djinn = Djinn.new()
     my_role = "public_dns:private_dns:open:instance_id:cloud1"
