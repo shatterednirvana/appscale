@@ -15,33 +15,22 @@
 # limitations under the License.
 #
 
+
+
+
 """Base class for implementing RPC of API proxy stubs."""
 
 
 
 
 
+
+
+
+
 import sys
-import threading
-from google.net import proto
-class rpcThread(threading.Thread):
-  def setup(self, stub, package, call, request, response):
-    self.success= True
-    self.stub = stub
-    self.package = package
-    self.call = call
-    self.request = request
-    self.response = response
-    self.__exception = None
-    self.__traceback  = None
-  def run(self):
-    try:
-      self.stub.MakeSyncCall(self.package, self.call,
-                             self.request, self.response)
-    except Exception:
-      self.success= False
-      _, self.__exception, self.__traceback = sys.exc_info()
-      
+
+
 class RPC(object):
   """Base class for implementing RPC of API proxy stubs.
 
@@ -83,7 +72,6 @@ class RPC(object):
     self.deadline = deadline
     self.stub = stub
     self.cpu_usage_mcycles = 0
-    self.__thread = None
 
   def Clone(self):
     """Make a shallow copy of this instances attributes, excluding methods.
@@ -153,37 +141,21 @@ class RPC(object):
     return self.__state
 
   def _MakeCallImpl(self):
+    """Override this method to implement a real asynchronous call rpc."""
     self.__state = RPC.RUNNING
-    self.__thread = rpcThread()
-    self.__thread.setup(self.stub, self.package, self.call,
-                              self.request, self.response)
-    self.__thread.start()
 
   def _WaitImpl(self):
-    """
+    """Override this method to implement a real asynchronous call rpc.
+
     Returns:
       True if the async call was completed successfully.
     """
     try:
-      if self.__state == RPC.RUNNING:
-        self.__thread.join()
-        if self.__thread.success == False:
-          # Try again but blocking this time
-          # This is a hack for the bulk uploaded because it requires
-          # the throttler to register threads
-          # TODO register the thread with the throttler
-          try:
-            self.stub.MakeSyncCall(self.package, self.call,
-                                 self.request, self.response)
-          except Exception:
-            _, self.__exception, self.__traceback = sys.exc_info()
-      else:
-        try:
-          self.stub.MakeSyncCall(self.package, self.call,
+      try:
+        self.stub.MakeSyncCall(self.package, self.call,
                                self.request, self.response)
-        except Exception:
-          _, self.__exception, self.__traceback = sys.exc_info()
-           
+      except Exception:
+        _, self.__exception, self.__traceback = sys.exc_info()
     finally:
       self.__state = RPC.FINISHING
       self.__Callback()

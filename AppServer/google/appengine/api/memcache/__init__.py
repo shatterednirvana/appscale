@@ -266,7 +266,7 @@ def _decode_value(stored_value, flags, do_unpickle):
   if type_number == TYPE_STR:
     return value
   elif type_number == TYPE_UNICODE:
-    return value.decode('utf-8')
+    return unicode(value, 'utf-8')
   elif type_number == TYPE_PICKLED:
     return do_unpickle(value)
   elif type_number == TYPE_BOOL:
@@ -311,6 +311,12 @@ class Client(object):
   string (unicode or not), int, long, or pickle-able Python object, including
   all native types.  You'll get back from the cache the same type that you
   originally put in.
+
+  The Client class is not thread-safe with respect to the gets(), cas() and
+  cas_multi() methods (and other compare-and-set-related methods). Therefore,
+  Client objects should not be used by more than one thread for CAS purposes.
+  Note that the global Client for the module-level functions is okay because it
+  does not expose any of the CAS methods.
   """
 
   def __init__(self, servers=None, debug=0,
@@ -321,7 +327,10 @@ class Client(object):
                pid=None,
                make_sync_call=None,
                _app_id=None,
-               _num_memcacheg_backends=None):
+               _num_memcacheg_backends=None,
+               _ignore_shardlock=None,
+               _memcache_pool_hint=None,
+               _memcache_sharding_strategy=None):
     """Create a new Client object.
 
     No parameters are required.
@@ -345,6 +354,12 @@ class Client(object):
 
 
 
+
+
+
+
+
+
     self._pickler_factory = pickler
     self._unpickler_factory = unpickler
     self._pickle_protocol = pickleProtocol
@@ -352,10 +367,16 @@ class Client(object):
     self._persistent_load = pload
     self._app_id = _app_id
     self._num_memcacheg_backends = _num_memcacheg_backends
+    self._ignore_shardlock = _ignore_shardlock
+    self._memcache_pool_hint = _memcache_pool_hint
+    self._memcache_sharding_strategy = _memcache_sharding_strategy
     self._cas_ids = {}
-    if _app_id and not _num_memcacheg_backends:
-      raise ValueError('If you specify an _app_id, you must also '
-                       'provide _num_memcacheg_backends')
+    if _app_id and not(_num_memcacheg_backends and
+                       _memcache_pool_hint and
+                       _memcache_sharding_strategy is not None):
+      raise ValueError('If you specify an _app_id, you must also provide '
+                       '_num_memcacheg_backends, _memcache_pool_hint, and '
+                       '_memcache_sharding_strategy')
 
   def cas_reset(self):
     """Clear the remembered CAS ids."""
@@ -404,7 +425,7 @@ class Client(object):
     return unpickler.load()
 
   def _add_app_id(self, message):
-    """Populate the app_id and num_memcacheg_backends fields in a message.
+    """Populates override field in message if accessing another app's memcache.
 
     Args:
       message: A protocol buffer supporting the mutable_override() operation.
@@ -413,6 +434,11 @@ class Client(object):
       app_override = message.mutable_override()
       app_override.set_app_id(self._app_id)
       app_override.set_num_memcacheg_backends(self._num_memcacheg_backends)
+      if self._ignore_shardlock:
+        app_override.set_ignore_shardlock(self._ignore_shardlock)
+      app_override.set_memcache_pool_hint(self._memcache_pool_hint)
+      app_override.set_memcache_sharding_strategy(
+          self._memcache_sharding_strategy)
 
   def set_servers(self, servers):
     """Sets the pool of memcache servers used by the client.

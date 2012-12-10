@@ -32,9 +32,7 @@ class representing a blob-key.
 
 
 import base64
-import cgi
 import email
-import os
 
 from google.appengine.api import datastore
 from google.appengine.api import datastore_errors
@@ -50,6 +48,7 @@ __all__ = ['BLOB_INFO_KIND',
            'BlobInfo',
            'BlobInfoParseError',
            'BlobKey',
+           'BlobMigrationRecord',
            'BlobNotFoundError',
            'BlobReferenceProperty',
            'BlobReader',
@@ -66,6 +65,8 @@ __all__ = ['BLOB_INFO_KIND',
            'delete_async',
            'fetch_data',
            'fetch_data_async',
+           'create_gs_key',
+           'create_gs_key_async',
            'get',
            'parse_blob_info']
 
@@ -83,10 +84,8 @@ create_upload_url = blobstore.create_upload_url
 create_upload_url_async = blobstore.create_upload_url_async
 delete = blobstore.delete
 delete_async = blobstore.delete_async
-
-
-class BlobInfoParseError(Error):
-  """CGI parameter does not contain valid BlobInfo record."""
+create_gs_key = blobstore.create_gs_key
+create_gs_key_async = blobstore.create_gs_key_async
 
 
 BLOB_INFO_KIND = blobstore.BLOB_INFO_KIND
@@ -95,6 +94,11 @@ BLOB_KEY_HEADER = blobstore.BLOB_KEY_HEADER
 BLOB_RANGE_HEADER = blobstore.BLOB_RANGE_HEADER
 MAX_BLOB_FETCH_SIZE = blobstore.MAX_BLOB_FETCH_SIZE
 UPLOAD_INFO_CREATION_HEADER = blobstore.UPLOAD_INFO_CREATION_HEADER
+
+
+class BlobInfoParseError(Error):
+  """CGI parameter does not contain valid BlobInfo record."""
+
 
 
 
@@ -125,7 +129,7 @@ class _GqlQuery(db.GqlQuery):
     app = kwds.pop('_app', None)
     self._proto_query = gql.GQL(query_string, _app=app, namespace='')
 
-    super(db.GqlQuery, self).__init__(model_class, namespace='')
+    super(db.GqlQuery, self).__init__(model_class)
     self.bind(*args, **kwds)
 
 
@@ -417,8 +421,8 @@ def parse_blob_info(field_storage):
   content_type = get_value(upload_content, 'content-type')
   size = get_value(upload_content, 'content-length')
   creation_string = get_value(upload_content, UPLOAD_INFO_CREATION_HEADER)
-  #md5_hash_encoded = get_value(upload_content, 'content-md5')
-  #md5_hash = base64.urlsafe_b64decode(md5_hash_encoded)
+  md5_hash_encoded = get_value(upload_content, 'content-md5')
+  md5_hash = base64.urlsafe_b64decode(md5_hash_encoded)
 
   try:
     size = int(size)
@@ -436,7 +440,7 @@ def parse_blob_info(field_storage):
                    'creation': creation,
                    'filename': filename,
                    'size': size,
-                   #'md5_hash': md5_hash,
+                   'md5_hash': md5_hash,
                    })
 
 
@@ -468,7 +472,8 @@ class BlobReferenceProperty(db.Property):
 
   def get_value_for_datastore(self, model_instance):
     """Translate model property to datastore value."""
-    blob_info = getattr(model_instance, self.name)
+    blob_info = super(BlobReferenceProperty,
+                      self).get_value_for_datastore(model_instance)
     if blob_info is None:
       return None
     return blob_info.key()
@@ -575,7 +580,12 @@ class BlobReader(object):
       blob: The blob key, blob info, or string blob key to read from.
       buffer_size: The minimum size to fetch chunks of data from blobstore.
       position: The initial position in the file.
+
+    Raises:
+      ValueError if a blob key, blob info or string blob key is not supplied.
     """
+    if not blob:
+      raise ValueError('A BlobKey, BlobInfo or string is required.')
     if hasattr(blob, 'key'):
       self.__blob_key = blob.key()
       self.__blob_info = blob
@@ -632,7 +642,9 @@ class BlobReader(object):
     Returns:
       Tuple (data, size):
         data: The bytes read from the buffer.
-        size: The remaining unread byte count.
+        size: The remaining unread byte count. Negative when size
+          is negative. Thus when remaining size != 0, the calling method
+          may choose to fill the buffer again and keep reading.
     """
 
     if not self.__blob_key:
@@ -803,3 +815,39 @@ class BlobReader(object):
   def closed(self):
     """Returns True if this file is closed, False otherwise."""
     return self.__blob_key is None
+
+
+class BlobMigrationRecord(db.Model):
+  """A model that records the result of a blob migration."""
+
+  new_blob_ref = BlobReferenceProperty(indexed=False, name='new_blob_key')
+
+  @classmethod
+  def kind(cls):
+    return blobstore.BLOB_MIGRATION_KIND
+
+  @classmethod
+  def get_by_blob_key(cls, old_blob_key):
+    """Fetches the BlobMigrationRecord for the given blob key.
+
+    Args:
+      old_blob_key: The blob key used in the previous app.
+
+    Returns:
+      A instance of blobstore.BlobMigrationRecord or None
+    """
+    return cls.get_by_key_name(str(old_blob_key))
+
+  @classmethod
+  def get_new_blob_key(cls, old_blob_key):
+    """Looks up the new key for a blob.
+
+    Args:
+      old_blob_key: The original blob key.
+
+    Returns:
+      The blobstore.BlobKey of the migrated blob.
+    """
+    record = cls.get_by_blob_key(old_blob_key)
+    if record:
+      return record.new_blob_ref.key()

@@ -15,21 +15,75 @@
 # limitations under the License.
 #
 
+
+
+
 """Base class for implementing API proxy stubs."""
 
 
 
 
 
+
+
+from __future__ import with_statement
+
+
+
+import os
+import random
+import threading
+import urllib
+
 from google.appengine.api import apiproxy_rpc
 from google.appengine.runtime import apiproxy_errors
-import logging
-import time
 
 
 MAX_REQUEST_SIZE = 1 << 20
-DS_STAT_LEVEL = 31
-#logging.addLevelName(DS_STAT_LEVEL, "DS_STAT")
+
+
+class RequestData(object):
+  """Allows stubs to lookup state linked to the request making the API call."""
+
+  def get_request_url(self, request_id):
+    """Returns the URL the request e.g. 'http://localhost:8080/foo?bar=baz'.
+
+    Args:
+      request_id: The string id of the request making the API call.
+
+    Returns:
+      The URL of the request as a string.
+    """
+    raise NotImplementedError()
+
+
+class _LocalRequestData(RequestData):
+  """Lookup information about a request using environment variables."""
+
+  def get_request_url(self, request_id):
+    """Returns the URL the request e.g. 'http://localhost:8080/foo?bar=baz'.
+
+    Args:
+      request_id: The string id of the request making the API call.
+
+    Returns:
+      The URL of the request as a string.
+    """
+    try:
+      host = os.environ['HTTP_HOST']
+    except KeyError:
+      host = os.environ['SERVER_NAME']
+      port = os.environ['SERVER_PORT']
+      if port != '80':
+        host += ':' + port
+    url = 'http://' + host
+    url += urllib.quote(os.environ.get('PATH_INFO', '/'))
+    if os.environ.get('QUERY_STRING'):
+      url += '?' + os.environ['QUERY_STRING']
+    return url
+
+
+_local_request_data = _LocalRequestData()
 
 
 class APIProxyStub(object):
@@ -41,7 +95,12 @@ class APIProxyStub(object):
     - Implement service methods as _Dynamic_<method>(request, response).
   """
 
-  def __init__(self, service_name, max_request_size=MAX_REQUEST_SIZE):
+
+
+  _ACCEPTS_REQUEST_ID = False
+
+  def __init__(self, service_name, max_request_size=MAX_REQUEST_SIZE,
+               request_data=None):
     """Constructor.
 
     Args:
@@ -49,9 +108,18 @@ class APIProxyStub(object):
       max_request_size: int, maximum allowable size of the incoming request.  A
         apiproxy_errors.RequestTooLargeError will be raised if the inbound
         request exceeds this size.  Default is 1 MB.
+      request_data: A RequestData instance used to look up state associated with
+          the request that generated an API call.
     """
     self.__service_name = service_name
     self.__max_request_size = max_request_size
+    self.request_data = request_data or _local_request_data
+
+
+
+    self._mutex = threading.RLock()
+    self.__error = None
+    self.__error_dict = {}
 
   def CreateRPC(self):
     """Creates RPC object instance.
@@ -61,7 +129,7 @@ class APIProxyStub(object):
     """
     return apiproxy_rpc.RPC(stub=self)
 
-  def MakeSyncCall(self, service, call, request, response):
+  def MakeSyncCall(self, service, call, request, response, request_id=None):
     """The main RPC entry point.
 
     Args:
@@ -70,6 +138,8 @@ class APIProxyStub(object):
         the underlying services methods and impemented by _Dynamic_<call>.
       request: A protocol buffer of the type corresponding to 'call'.
       response: A protocol buffer of the type corresponding to 'call'.
+      request_id: A unique string identifying the request associated with the
+          API call.
     """
     assert service == self.__service_name, ('Expected "%s" service name, '
                                             'was "%s"' % (self.__service_name,
@@ -79,12 +149,59 @@ class APIProxyStub(object):
           'The request to API call %s.%s() was too large.' % (service, call))
     messages = []
     assert request.IsInitialized(messages), messages
-    #start = time.time()
+
+
+
+
+    exception_type, frequency = self.__error_dict.get(call, (None, None))
+    if exception_type and frequency:
+      if random.random() <= frequency:
+        raise exception_type
+
+    if self.__error:
+      if random.random() <= self.__error_rate:
+        raise self.__error
+
 
     method = getattr(self, '_Dynamic_' + call)
-    method(request, response)
-    #end = time.time()
-    # Only log datastore calls, dont worry about memcache for now
-    #if service == "datastore_v3":
-    #  logging.log(DS_STAT_LEVEL,"qtype %s time %s" % (call, (end-start)))
+    if self._ACCEPTS_REQUEST_ID:
+      method(request, response, request_id)
+    else:
+      method(request, response)
 
+  def SetError(self, error, method=None, error_rate=1):
+    """Set an error condition that may be raised when calls made to stub.
+
+    If a method is specified, the error will only apply to that call.
+    The error rate is applied to the method specified or all calls if
+    method is not set.
+
+    Args:
+      error: An instance of apiproxy_errors.Error or None for no error.
+      method: A string representing the method that the error will affect.
+      error_rate: a number from [0, 1] that sets the chance of the error,
+        defaults to 1.
+    """
+    assert error is None or isinstance(error, apiproxy_errors.Error)
+    if method and error:
+      self.__error_dict[method] = error, error_rate
+    else:
+      self.__error_rate = error_rate
+      self.__error = error
+
+
+def Synchronized(method):
+  """Decorator to acquire a mutex around an APIProxyStub method.
+
+  Args:
+    method: An unbound method of APIProxyStub or a subclass.
+
+  Returns:
+    The method, altered such it acquires self._mutex throughout its execution.
+  """
+
+  def WrappedMethod(self, *args, **kwargs):
+    with self._mutex:
+      return method(self, *args, **kwargs)
+
+  return WrappedMethod

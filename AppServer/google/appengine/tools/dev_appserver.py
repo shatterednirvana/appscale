@@ -40,8 +40,9 @@ from google.appengine.tools import os_compat
 
 import __builtin__
 import BaseHTTPServer
-import Cookie
 import base64
+import binascii
+import calendar
 import cStringIO
 import cgi
 import cgitb
@@ -56,16 +57,14 @@ import logging
 import mimetools
 import mimetypes
 import os
-import pdb
-import random
 import select
 import shutil
 import simplejson
+import struct
 import tempfile
 import yaml
 
-#AppScale
-import resource
+
 
 
 
@@ -84,7 +83,6 @@ import urllib
 import zlib
 
 import google
-from google.pyglib import gexcept
 
 
 
@@ -101,13 +99,18 @@ from google.appengine.api import appinfo_includes
 from google.appengine.api import app_logging
 from google.appengine.api import blobstore
 from google.appengine.api import croninfo
-from google.appengine.api import datastore_admin
+from google.appengine.api import datastore
+from google.appengine.api import datastore_file_stub
 from google.appengine.api import lib_config
 from google.appengine.api import mail
+from google.appengine.api import mail_stub
+from google.appengine.api import namespace_manager
 from google.appengine.api import urlfetch_stub
 from google.appengine.api import user_service_stub
 from google.appengine.api import yaml_errors
 from google.appengine.api.app_identity import app_identity_stub
+from google.appengine.api.blobstore import blobstore_stub
+from google.appengine.api.blobstore import file_blob_storage
 
 from google.appengine.api.capabilities import capability_stub
 from google.appengine.api.conversion import conversion_stub
@@ -116,28 +119,17 @@ from google.appengine.api.files import file_service_stub
 from google.appengine.api.logservice import logservice
 from google.appengine.api.logservice import logservice_stub
 from google.appengine.api.search import simple_search_stub
+from google.appengine.api.taskqueue import taskqueue_stub
 from google.appengine.api.prospective_search import prospective_search_stub
+from google.appengine.api.memcache import memcache_stub
 from google.appengine.api import rdbms_mysqldb
 
 from google.appengine.api.system import system_stub
+from google.appengine.api.xmpp import xmpp_service_stub
+from google.appengine.datastore import datastore_sqlite_stub
 from google.appengine.datastore import datastore_stub_util
 
 from google.appengine import dist
-
-# Modified for AppScale
-from google.appengine.api.taskqueue import taskqueue_rabbitmq
-from google.appengine.api import mail_stub
-from google.appengine.api.blobstore import blobstore_stub
-# AppScale files
-from google.appengine.api import datastore_distributed
-from google.appengine.api.blobstore import datastore_blob_storage
-from google.appengine.api.memcache import memcache_distributed
-from google.appengine.api.xmpp import xmpp_service_real
-# AppScale APIs
-from google.appengine.api.appscale import babel
-from google.appengine.api.appscale import ec2
-from google.appengine.api.appscale import mapreduce
-from google.appengine.api.appscale import neptune
 
 try:
   from google.appengine.runtime import request_environment
@@ -147,14 +139,14 @@ except:
   request_environment = None
   runtime = None
 
+from google.appengine.tools import dev_appserver_apiserver
+from google.appengine.tools import dev_appserver_blobimage
 from google.appengine.tools import dev_appserver_blobstore
 from google.appengine.tools import dev_appserver_channel
-from google.appengine.tools import dev_appserver_blobimage
 from google.appengine.tools import dev_appserver_import_hook
-from google.appengine.tools import dev_appserver_index
 from google.appengine.tools import dev_appserver_login
-from google.appengine.tools import dev_appserver_oauth
 from google.appengine.tools import dev_appserver_multiprocess as multiprocess
+from google.appengine.tools import dev_appserver_oauth
 from google.appengine.tools import dev_appserver_upload
 
 from google.storage.speckle.python.api import rdbms
@@ -187,13 +179,12 @@ FILE_MISSING_EXCEPTIONS = frozenset([errno.ENOENT, errno.ENOTDIR])
 MAX_URL_LENGTH = 2047
 
 
+
 DEFAULT_ENV = {
     'GATEWAY_INTERFACE': 'CGI/1.1',
     'AUTH_DOMAIN': 'gmail.com',
     'USER_ORGANIZATION': '',
     'TZ': 'UTC',
-    'COOKIE_SERCRET':'secret',
-    'LOGIN_SERVER':'0.0.0.0',
 }
 
 
@@ -233,15 +224,22 @@ DEVEL_PAYLOAD_RAW_HEADER = 'X-AppEngine-Development-Payload'
 DEVEL_FAKE_IS_ADMIN_HEADER = 'HTTP_X_APPENGINE_FAKE_IS_ADMIN'
 DEVEL_FAKE_IS_ADMIN_RAW_HEADER = 'X-AppEngine-Fake-Is-Admin'
 
-#AppScale
-# Soft cap on memory. If over dev_appserver will stop serving traffic and 
-# shut down. It will randomly choose to exit based on MAX_RANDOM_TARGET,
-# hence the reason it is soft and not hard . Units are in KBs.
-SOFT_CAP_MEM = 150000
+FILE_STUB_DEPRECATION_MESSAGE = (
+"""The datastore file stub is deprecated, and
+will stop being the default in a future release.
+Append the --use_sqlite flag to use the new SQLite stub.
 
-# Max number for randomly killing the dev_appserver when over the soft 
-# memory cap.
-MAX_RANDOM_TARGET = 25
+You can port your existing data using the --port_sqlite_data flag or
+purge your previous test data with --clear_datastore.
+""")
+
+
+
+
+
+NON_PUBLIC_CACHE_CONTROLS = frozenset(['private', 'no-cache', 'no-store'])
+
+
 
 class Error(Exception):
   """Base-class for exceptions in this module."""
@@ -259,6 +257,12 @@ class CompileError(Error):
   """Application could not be compiled."""
   def __init__(self, text):
     self.text = text
+
+class ExecuteError(Error):
+  """Application could not be executed."""
+  def __init__(self, text, log):
+    self.text = text
+    self.log = log
 
 
 
@@ -290,6 +294,30 @@ def MonkeyPatchPdb(pdb):
     p.set_trace(sys._getframe().f_back)
 
   pdb.set_trace = NewSetTrace
+
+
+def MonkeyPatchThreadingLocal(_threading_local):
+  """Given a reference to the _threading_local module, fix _localbase.__new__.
+
+  This ensures that using dev_appserver with a Python interpreter older than
+  2.7 will include the fix to the _threading_local._localbase.__new__ method
+  which was introduced in Python 2.7 (http://bugs.python.org/issue1522237).
+  """
+
+  @staticmethod
+  def New(cls, *args, **kw):
+    self = object.__new__(cls)
+    key = '_local__key', 'thread.local.' + str(id(self))
+    object.__setattr__(self, '_local__key', key)
+    object.__setattr__(self, '_local__args', (args, kw))
+    object.__setattr__(self, '_local__lock', _threading_local.RLock())
+    if (args or kw) and (cls.__init__ is object.__init__):
+      raise TypeError('Initialization arguments are not supported')
+    dict = object.__getattribute__(self, '__dict__')
+    _threading_local.current_thread().__dict__[key] = dict
+    return self
+
+  _threading_local._localbase.__new__ = New
 
 
 def SplitURL(relative_url):
@@ -383,7 +411,6 @@ class AppServerRequest(object):
     infile: File-like object with input data from the request.
     force_admin: Allow request admin-only URLs to proceed regardless of whether
       user is logged in or is an admin.
-    secret_hash: Security for task queue paths
   """
 
   ATTRIBUTES = ['relative_url',
@@ -398,7 +425,6 @@ class AppServerRequest(object):
                path,
                headers,
                infile,
-               secret_hash,
                force_admin=False):
     """Constructor.
 
@@ -414,12 +440,9 @@ class AppServerRequest(object):
     self.headers = headers
     self.infile = infile
     self.force_admin = force_admin
-    if DEVEL_PAYLOAD_RAW_HEADER in self.headers:
-      if self.headers[DEVEL_PAYLOAD_RAW_HEADER] == secret_hash:
-        self.force_admin = True
-    if (DEVEL_FAKE_IS_ADMIN_RAW_HEADER in self.headers):
-      if self.headers[DEVEL_FAKE_IS_ADMIN_RAW_HEADER] == secret_hash:
-        self.force_admin = True
+    if (DEVEL_PAYLOAD_RAW_HEADER in self.headers or
+        DEVEL_FAKE_IS_ADMIN_RAW_HEADER in self.headers):
+      self.force_admin = True
 
   def __eq__(self, other):
     """Used mainly for testing.
@@ -487,6 +510,10 @@ class URLDispatcher(object):
       dispatched_output: StringIO buffer containing the results from the
        dispatched
       original_output: The original output file.
+
+    Returns:
+      None if request handling is complete.
+      A new AppServerRequest instance if internal redirect is required.
     """
     original_output.write(dispatched_output.read())
 
@@ -607,6 +634,7 @@ class MatcherDispatcher(URLDispatcher):
   def __init__(self,
                config,
                login_url,
+               module_manager,
                url_matchers,
                get_user_info=dev_appserver_login.GetUserInfo,
                login_redirect=dev_appserver_login.LoginRedirect):
@@ -615,12 +643,15 @@ class MatcherDispatcher(URLDispatcher):
     Args:
       config: AppInfoExternal instance representing the parsed app.yaml file.
       login_url: Relative URL which should be used for handling user logins.
+      module_manager: ModuleManager instance that is used to detect and reload
+        modules if the matched Dispatcher is dynamic.
       url_matchers: Sequence of URLMatcher objects.
       get_user_info: Used for dependency injection.
       login_redirect: Used for dependency injection.
     """
     self._config = config
     self._login_url = login_url
+    self._module_manager = module_manager
     self._url_matchers = tuple(url_matchers)
     self._get_user_info = get_user_info
     self._login_redirect = login_redirect
@@ -638,7 +669,7 @@ class MatcherDispatcher(URLDispatcher):
     The value of request.path is ignored.
     """
     cookies = ', '.join(request.headers.getheaders('cookie'))
-    email_addr, user_id, admin, valid_cookie = self._get_user_info(cookies)
+    email_addr, admin, user_id = self._get_user_info(cookies)
 
     for matcher in self._url_matchers:
       dispatcher, matched_path, requires_login, admin_only, auth_fail_action = matcher.Match(request.relative_url)
@@ -671,11 +702,20 @@ class MatcherDispatcher(URLDispatcher):
                       % (httplib.FORBIDDEN, email_addr))
       else:
         request.path = matched_path
+
+
+
+
+
+        if (not isinstance(dispatcher, FileDispatcher) and
+            self._module_manager.AreModuleFilesModified()):
+          self._module_manager.ResetModules()
+
         forward_request = dispatcher.Dispatch(request,
                                               outfile,
                                               base_env_dict=base_env_dict)
 
-        if forward_request:
+        while forward_request:
 
           logging.info('Internal redirection to %s',
                        forward_request.relative_url)
@@ -685,7 +725,7 @@ class MatcherDispatcher(URLDispatcher):
                         dict(base_env_dict))
 
           new_outfile.seek(0)
-          dispatcher.EndRedirect(new_outfile, outfile)
+          forward_request = dispatcher.EndRedirect(new_outfile, outfile)
 
 
       return
@@ -699,16 +739,38 @@ class MatcherDispatcher(URLDispatcher):
 
 
 
-_IGNORE_REQUEST_HEADERS = frozenset(['content-type', 'content-length',
-                                     'accept-encoding', 'transfer-encoding'])
+
+_IGNORE_REQUEST_HEADERS = frozenset([
+    'accept-encoding',
+    'connection',
+    'keep-alive',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+
+
+    'content-type',
+    'content-length',
+    ])
 
 
 _request_id = 0
+_request_time = 0
 
 
 def _generate_request_id_hash():
   """Generates a hash of the current request id."""
   return hashlib.sha1(str(_request_id)).hexdigest()[:8].upper()
+
+
+def _GenerateRequestLogId():
+  """Generates the request log id for the current request."""
+  sec = int(_request_time)
+  usec = int(1000000 * (_request_time - sec))
+  h = hashlib.sha1(str(_request_id)).digest()[:4]
+  packed = struct.Struct('> L L').pack(sec, usec)
+  return binascii.b2a_hex(packed + h)
 
 
 def GetGoogleSqlOAuth2RefreshToken(oauth_file_path):
@@ -760,21 +822,11 @@ def SetupEnvironment(cgi_path,
   env['CONTENT_LENGTH'] = headers.getheader('content-length', '')
 
   cookies = ', '.join(headers.getheaders('cookie'))
-  email_addr, user_id, admin, valid_cookie = get_user_info(cookies)
-
-  if valid_cookie:
-    env['USER_EMAIL'] = email_addr
-    env['USER_ID'] = user_id
-    env['USER_NICKNAME'] = user_id
-  else:
-    env['USER_EMAIL'] = ""
-    env['USER_ID'] = ""
-    env['USER_NICKNAME'] = ""
-
-  env['USER_IS_ADMIN'] = '0'
-  if admin and valid_cookie:
+  email_addr, admin, user_id = get_user_info(cookies)
+  env['USER_EMAIL'] = email_addr
+  env['USER_ID'] = user_id
+  if admin:
     env['USER_IS_ADMIN'] = '1'
-
   if env['AUTH_DOMAIN'] == '*':
 
     auth_domain = 'gmail.com'
@@ -784,6 +836,9 @@ def SetupEnvironment(cgi_path,
     env['AUTH_DOMAIN'] = auth_domain
 
   global _request_id
+  global _request_time
+  _request_time = time.time()
+  env['REQUEST_LOG_ID'] = _GenerateRequestLogId()
   env['REQUEST_ID_HASH'] = _generate_request_id_hash()
   _request_id += 1
 
@@ -811,7 +866,8 @@ def SetupEnvironment(cgi_path,
   if DEVEL_FAKE_IS_ADMIN_HEADER in env:
     del env[DEVEL_FAKE_IS_ADMIN_HEADER]
 
-  token = GetGoogleSqlOAuth2RefreshToken(rdbms.OAUTH_CREDENTIALS_PATH)
+  token = GetGoogleSqlOAuth2RefreshToken(os.path.expanduser(
+      rdbms.OAUTH_CREDENTIALS_PATH))
   if token:
     env['GOOGLE_SQL_OAUTH2_REFRESH_TOKEN'] = token
 
@@ -858,29 +914,44 @@ def ClearAllButEncodingsModules(module_dict):
     module_dict: Dictionary in the form used by sys.modules.
   """
   for module_name in module_dict.keys():
-    if not IsEncodingsModule(module_name):
+
+
+    if not IsEncodingsModule(module_name) and module_name != 'sys':
       del module_dict[module_name]
 
 
-def UpdateNotSharedModulesInParents(module_dict):
-  """Replace modules not shared between the hardened and unhardened parts of the
-  process in their parent packages.
+def ConnectAndDisconnectChildModules(old_module_dict, new_module_dict):
+  """Prepares for switching from old_module_dict to new_module_dict.
 
-  If foo.bar is not shared then this replaces the reference to bar contained in
-  foo with the foo.bar in module_dict if it is present and deletes it otherwise.
+  Disconnects child modules going away from parents that remain, and reconnects
+  child modules that are being added back in to old parents.  This is needed to
+  satisfy code that follows the getattr() descendant chain rather than looking
+  up the desired module directly in the module dict.
 
   Args:
-    module_dict: A dict containing the modules to be added to sys.modules.
-
+    old_module_dict: The module dict being replaced, looks like sys.modules.
+    new_module_dict: The module dict takings its place, looks like sys.modules.
   """
-  for prefix in NOT_SHARED_MODULE_PREFIXES:
-    parent_name, _, submodule_name = prefix.rpartition('.')
-    parent = module_dict.get(parent_name)
-    if parent:
-      if prefix in module_dict:
-        setattr(parent, submodule_name, module_dict[prefix])
-      elif hasattr(parent, submodule_name):
-        delattr(parent, submodule_name)
+  old_keys = set(old_module_dict.keys())
+  new_keys = set(new_module_dict.keys())
+  for deleted_module_name in old_keys - new_keys:
+    if old_module_dict[deleted_module_name] is None:
+      continue
+    segments = deleted_module_name.rsplit('.', 1)
+    if len(segments) == 2:
+      parent_module = new_module_dict.get(segments[0])
+      if parent_module and hasattr(parent_module, segments[1]):
+        delattr(parent_module, segments[1])
+  for added_module_name in new_keys - old_keys:
+    if new_module_dict[added_module_name] is None:
+      continue
+    segments = added_module_name.rsplit('.', 1)
+    if len(segments) == 2:
+      parent_module = old_module_dict.get(segments[0])
+      child_module = new_module_dict[added_module_name]
+      if (parent_module and
+          getattr(parent_module, segments[1], None) is not child_module):
+        setattr(parent_module, segments[1], child_module)
 
 
 
@@ -1008,8 +1079,8 @@ def CheckScriptExists(cgi_path, handler_path):
       like 'foo/bar/baz.py'). May contain $PYTHON_LIB references.
 
   Raises:
-    CouldNotFindModuleError if the given handler_path is a file and doesn't have
-    the expected extension.
+    CouldNotFindModuleError: if the given handler_path is a file and doesn't
+    have the expected extension.
   """
   if handler_path.startswith(PYTHON_LIB_VAR + '/'):
 
@@ -1398,8 +1469,20 @@ def ExecutePy27Handler(config, handler_path, cgi_path, import_hook):
   post_data = sys.stdin.read()
 
 
-  if post_data and 'CONTENT_TYPE' in env:
-    env['HTTP_CONTENT_TYPE'] = env['CONTENT_TYPE']
+
+
+
+
+
+
+  if 'CONTENT_TYPE' in env:
+    if post_data:
+      env['HTTP_CONTENT_TYPE'] = env['CONTENT_TYPE']
+    del env['CONTENT_TYPE']
+  if 'CONTENT_LENGTH' in env:
+    if env['CONTENT_LENGTH']:
+      env['HTTP_CONTENT_LENGTH'] = env['CONTENT_LENGTH']
+    del env['CONTENT_LENGTH']
 
   if cgi_path.endswith(handler_path):
     application_root = cgi_path[:-len(handler_path)]
@@ -1413,6 +1496,9 @@ def ExecutePy27Handler(config, handler_path, cgi_path, import_hook):
 
     import pdb
     MonkeyPatchPdb(pdb)
+
+    import _threading_local
+    MonkeyPatchThreadingLocal(_threading_local)
 
 
 
@@ -1521,7 +1607,7 @@ def ExecuteCGI(config,
 
   if handler_path == '_go_app':
     from google.appengine.ext.go import execute_go_cgi
-    return execute_go_cgi(root_path, handler_path, cgi_path,
+    return execute_go_cgi(root_path, config, handler_path, cgi_path,
         env, infile, outfile)
 
 
@@ -1534,14 +1620,13 @@ def ExecuteCGI(config,
   old_env = os.environ.copy()
   old_cwd = os.getcwd()
   old_file_type = types.FileType
-  old_path = sys.path[:]
   reset_modules = False
   app_log_handler = None
 
   try:
+    ConnectAndDisconnectChildModules(sys.modules, module_dict)
     ClearAllButEncodingsModules(sys.modules)
     sys.modules.update(module_dict)
-    UpdateNotSharedModulesInParents(module_dict)
     sys.argv = [cgi_path]
 
     sys.stdin = cStringIO.StringIO(infile.getvalue())
@@ -1556,15 +1641,8 @@ def ExecuteCGI(config,
     app_log_handler = app_logging.AppLogsHandler(
         logservice.logs_buffer().stream())
     logging.getLogger().addHandler(app_log_handler)
- 
-    # Don't clear the environment, so that users can use
-    # the EC2 API once they set the credentials
-    # but do clear out the secret and certain other vars
-    # set by default so that malicious apps can't see them
-    #os.environ.clear()
-    os.environ["COOKIE_SECRET"] = ""
-    os.environ["MASTER_IP"] = ""
-    os.environ["LOCAL_DB_IP"] = ""
+
+    os.environ.clear()
     os.environ.update(env)
 
 
@@ -1627,9 +1705,9 @@ def ExecuteCGI(config,
 
 
     module_dict.update(sys.modules)
+    ConnectAndDisconnectChildModules(sys.modules, old_module_dict)
     ClearAllButEncodingsModules(sys.modules)
     sys.modules.update(old_module_dict)
-    UpdateNotSharedModulesInParents(old_module_dict)
 
     __builtin__.__dict__.update(old_builtin)
     sys.argv = old_argv
@@ -1640,10 +1718,6 @@ def ExecuteCGI(config,
     logservice_stub._flush_logs_buffer()
     sys.stderr = old_stderr
     logging.getLogger().removeHandler(app_log_handler)
-
-
-
-    sys.path[:] = old_path
 
     os.environ.clear()
     os.environ.update(old_env)
@@ -1698,6 +1772,10 @@ class CGIDispatcher(URLDispatcher):
     before_level = logging.root.level
     try:
       env = {}
+
+
+      if self._config.env_variables:
+        env.update(self._config.env_variables)
       if base_env_dict:
         env.update(base_env_dict)
       cgi_path = self._path_adjuster.AdjustPath(request.path)
@@ -1812,6 +1890,7 @@ class StaticFileConfigMatcher(object):
   Specifically:
   - Computes mime type based on URLMap and file extension.
   - Decides on cache expiration time based on URLMap and default expiration.
+  - Decides what HTTP headers to add to responses.
 
   To determine the mime type, we first see if there is any mime-type property
   on each URLMap entry. If non is specified, we use the mimetypes module to
@@ -1821,7 +1900,6 @@ class StaticFileConfigMatcher(object):
 
   def __init__(self,
                url_map_list,
-               path_adjuster,
                default_expiration):
     """Initializer.
 
@@ -1829,7 +1907,6 @@ class StaticFileConfigMatcher(object):
       url_map_list: List of appinfo.URLMap objects.
         If empty or None, then we always use the mime type chosen by the
         mimetypes module.
-      path_adjuster: PathAdjuster object used to adjust application file paths.
       default_expiration: String describing default expiration time for browser
         based caching of static files.  If set to None this disallows any
         browser caching of static content.
@@ -1841,67 +1918,69 @@ class StaticFileConfigMatcher(object):
 
 
     self._patterns = []
+    for url_map in url_map_list or []:
 
-    if url_map_list:
-      for entry in url_map_list:
-        handler_type = entry.GetHandlerType()
-        if handler_type not in (appinfo.STATIC_FILES, appinfo.STATIC_DIR):
-          continue
+      handler_type = url_map.GetHandlerType()
+      if handler_type not in (appinfo.STATIC_FILES, appinfo.STATIC_DIR):
+        continue
 
-        if handler_type == appinfo.STATIC_FILES:
-          regex = entry.upload + '$'
-        else:
-          path = entry.static_dir
-          if path[-1] == '/':
-            path = path[:-1]
-          regex = re.escape(path + os.path.sep) + r'(.*)'
+      path_re = _StaticFilePathRe(url_map)
+      try:
+        self._patterns.append((re.compile(path_re), url_map))
+      except re.error, e:
+        raise InvalidAppConfigError('regex %s does not compile: %s' %
+                                    (path_re, e))
 
-        try:
-          path_re = re.compile(regex)
-        except re.error, e:
-          raise InvalidAppConfigError('regex %s does not compile: %s' %
-                                      (regex, e))
+  _DUMMY_URLMAP = appinfo.URLMap()
 
-        if self._default_expiration is None:
+  def _FirstMatch(self, path):
+    """Returns the first appinfo.URLMap that matches path, or a dummy instance.
 
-          expiration = 0
-        elif entry.expiration is None:
+    A dummy instance is returned when no appinfo.URLMap matches path (see the
+    URLMap.static_file_path_re property). When a dummy instance is returned, it
+    is always the same one. The dummy instance is constructed simply by doing
+    the following:
 
-          expiration = self._default_expiration
-        else:
-          expiration = appinfo.ParseExpiration(entry.expiration)
+      appinfo.URLMap()
 
-        self._patterns.append((path_re, entry.mime_type, expiration))
+    Args:
+      path: A string containing the file's path relative to the app.
+
+    Returns:
+      The first appinfo.URLMap (in the list that was passed to the constructor)
+      that matches path. Matching depends on whether URLMap is a static_dir
+      handler or a static_files handler. In either case, matching is done
+      according to the URLMap.static_file_path_re property.
+    """
+    for path_re, url_map in self._patterns:
+      if path_re.match(path):
+        return url_map
+    return StaticFileConfigMatcher._DUMMY_URLMAP
 
   def IsStaticFile(self, path):
     """Tests if the given path points to a "static" file.
 
     Args:
-      path: String containing the file's path relative to the app.
+      path: A string containing the file's path relative to the app.
 
     Returns:
       Boolean, True if the file was configured to be static.
     """
-    for (path_re, _, _) in self._patterns:
-      if path_re.match(path):
-        return True
-    return False
+    return self._FirstMatch(path) is not self._DUMMY_URLMAP
 
   def GetMimeType(self, path):
     """Returns the mime type that we should use when serving the specified file.
 
     Args:
-      path: String containing the file's path relative to the app.
+      path: A string containing the file's path relative to the app.
 
     Returns:
       String containing the mime type to use. Will be 'application/octet-stream'
       if we have no idea what it should be.
     """
-    for (path_re, mimetype, unused_expiration) in self._patterns:
-      if mimetype is not None:
-        the_match = path_re.match(path)
-        if the_match:
-          return mimetype
+    url_map = self._FirstMatch(path)
+    if url_map.mime_type is not None:
+      return url_map.mime_type
 
 
     unused_filename, extension = os.path.splitext(path)
@@ -1911,18 +1990,33 @@ class StaticFileConfigMatcher(object):
     """Returns the cache expiration duration to be users for the given file.
 
     Args:
-      path: String containing the file's path relative to the app.
+      path: A string containing the file's path relative to the app.
 
     Returns:
       Integer number of seconds to be used for browser cache expiration time.
     """
-    for (path_re, unused_mimetype, expiration) in self._patterns:
-      the_match = path_re.match(path)
-      if the_match:
-        return expiration
 
+    if self._default_expiration is None:
+      return 0
 
-    return self._default_expiration or 0
+    url_map = self._FirstMatch(path)
+    if url_map.expiration is None:
+      return self._default_expiration
+
+    return appinfo.ParseExpiration(url_map.expiration)
+
+  def GetHttpHeaders(self, path):
+    """Returns http_headers of the matching appinfo.URLMap, or an empty one.
+
+    Args:
+      path: A string containing the file's path relative to the app.
+
+    Returns:
+      A user-specified HTTP headers to be used in static content response. These
+      headers are contained in an appinfo.HttpHeadersDict, which maps header
+      names to values (both strings).
+    """
+    return self._FirstMatch(path).http_headers or appinfo.HttpHeadersDict()
 
 
 
@@ -1982,10 +2076,7 @@ class FileDispatcher(URLDispatcher):
     self._static_file_config_matcher = static_file_config_matcher
     self._read_data_file = read_data_file
 
-  def Dispatch(self,
-               request,
-               outfile,
-               base_env_dict=None):
+  def Dispatch(self, request, outfile, base_env_dict=None):
     """Reads the file and returns the response status and data."""
     full_path = self._path_adjuster.AdjustPath(request.path)
     status, data = self._read_data_file(full_path)
@@ -1996,27 +2087,46 @@ class FileDispatcher(URLDispatcher):
     if_match_etag = request.headers.get('if-match', None)
     if_none_match_etag = request.headers.get('if-none-match', '').split(',')
 
+    http_headers = self._static_file_config_matcher.GetHttpHeaders(request.path)
+    def WriteHeader(name, value):
+      if http_headers.Get(name) is None:
+        outfile.write('%s: %s\r\n' % (name, value))
+
+
+
+
+
     if if_match_etag and not self._CheckETagMatches(if_match_etag.split(','),
                                                     current_etag,
                                                     False):
       outfile.write('Status: %s\r\n' % httplib.PRECONDITION_FAILED)
-      outfile.write('ETag: "%s"\r\n' % current_etag)
+      WriteHeader('ETag', current_etag)
       outfile.write('\r\n')
     elif self._CheckETagMatches(if_none_match_etag, current_etag, True):
       outfile.write('Status: %s\r\n' % httplib.NOT_MODIFIED)
-      outfile.write('ETag: "%s"\r\n' % current_etag)
+      WriteHeader('ETag', current_etag)
       outfile.write('\r\n')
     else:
-      outfile.write('Status: %d\r\n' % status)
-      outfile.write('Content-type: %s\r\n' % content_type)
-      if expiration:
 
-        outfile.write('Expires: %s\r\n'
-                      % email.Utils.formatdate(time.time() + expiration,
-                                               usegmt=True))
-        outfile.write('Cache-Control: public, max-age=%i\r\n' % expiration)
+
+
+      outfile.write('Status: %d\r\n' % status)
+
+      WriteHeader('Content-Type', content_type)
+
+
+      if expiration:
+        fmt = email.Utils.formatdate
+        WriteHeader('Expires', fmt(time.time() + expiration, usegmt=True))
+        WriteHeader('Cache-Control', 'public, max-age=%i' % expiration)
+
+
       if static_file:
-        outfile.write('ETag: "%s"\r\n' % current_etag)
+        WriteHeader('ETag', '"%s"' % current_etag)
+
+      for header in http_headers.iteritems():
+        outfile.write('%s: %s\r\n' % header)
+
       outfile.write('\r\n')
       outfile.write(data)
 
@@ -2057,9 +2167,18 @@ class FileDispatcher(URLDispatcher):
 
 
 
+
 _IGNORE_RESPONSE_HEADERS = frozenset([
-    'content-encoding', 'accept-encoding', 'transfer-encoding',
-    'server', 'date', blobstore.BLOB_KEY_HEADER
+    'connection',
+    'content-encoding',
+    'date',
+    'keep-alive',
+    'proxy-authenticate',
+    'server',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    blobstore.BLOB_KEY_HEADER
     ])
 
 
@@ -2131,6 +2250,9 @@ class AppServerResponse(object):
     for header in self.headers.headers:
       header = header.rstrip('\n\r')
       header_list.append(header)
+    if not self.headers.getheader('Content-Type'):
+
+      header_list.append('Content-Type: text/html')
 
     return '\r\n'.join(header_list) + '\r\n'
 
@@ -2141,13 +2263,29 @@ def IgnoreHeadersRewriter(response):
   Certain response headers cannot be modified by an Application.  For a
   complete list of these headers please see:
 
-    http://code.google.com/appengine/docs/webapp/responseclass.html#Disallowed_HTTP_Response_Headers
+    https://developers.google.com/appengine/docs/python/tools/webapp/responseclass#Disallowed_HTTP_Response_Headers
 
   This rewriter simply removes those headers.
   """
   for h in _IGNORE_RESPONSE_HEADERS:
     if h in response.headers:
       del response.headers[h]
+
+
+def ValidHeadersRewriter(response):
+  """Remove invalid response headers.
+
+  Response headers must be printable ascii characters. This is enforced in
+  production by http_proto.cc IsValidHeader.
+
+  This rewriter will remove headers that contain non ascii characters.
+  """
+  for (key, value) in response.headers.items():
+    try:
+      key.decode('ascii')
+      value.decode('ascii')
+    except UnicodeDecodeError:
+      del response.headers[key]
 
 
 def ParseStatusRewriter(response):
@@ -2182,32 +2320,92 @@ def ParseStatusRewriter(response):
         'Error: Invalid "status" header value returned.')
 
 
+def GetAllHeaders(message, name):
+  """Get all headers of a given name in a message.
+
+  Args:
+    message: A mimetools.Message object.
+    name: The name of the header.
+
+  Yields:
+    A sequence of values of all headers with the given name.
+  """
+  for header_line in message.getallmatchingheaders(name):
+    yield header_line.split(':', 1)[1].strip()
+
+
 def CacheRewriter(response):
   """Update the cache header."""
 
-  if response.status_code != httplib.NOT_MODIFIED:
-    if not 'Cache-Control' in response.headers:
-      response.headers['Cache-Control'] = 'no-cache'
-      if not 'Expires' in response.headers:
-        response.headers['Expires'] = 'Fri, 01 Jan 1990 00:00:00 GMT'
+
+  if response.status_code == httplib.NOT_MODIFIED:
+    return
+
+  if not 'Cache-Control' in response.headers:
+    response.headers['Cache-Control'] = 'no-cache'
+    if not 'Expires' in response.headers:
+      response.headers['Expires'] = 'Fri, 01 Jan 1990 00:00:00 GMT'
 
 
-def ContentLengthRewriter(response):
+  if 'Set-Cookie' in response.headers:
+
+
+
+    current_date = time.time()
+    expires = response.headers.get('Expires')
+    reset_expires = True
+    if expires:
+      expires_time = email.Utils.parsedate(expires)
+      if expires_time:
+        reset_expires = calendar.timegm(expires_time) >= current_date
+    if reset_expires:
+      response.headers['Expires'] = time.strftime('%a, %d %b %Y %H:%M:%S GMT',
+                                                  time.gmtime(current_date))
+
+
+
+    cache_directives = []
+    for header in GetAllHeaders(response.headers, 'Cache-Control'):
+      cache_directives.extend(v.strip() for v in header.split(','))
+    cache_directives = [d for d in cache_directives if d != 'public']
+    if not NON_PUBLIC_CACHE_CONTROLS.intersection(cache_directives):
+      cache_directives.append('private')
+    response.headers['Cache-Control'] = ', '.join(cache_directives)
+
+
+def _RemainingDataSize(input_buffer):
+  """Computes how much data is remaining in the buffer.
+
+  It leaves the buffer in its initial state.
+
+  Args:
+    input_buffer: a file-like object with seek and tell methods.
+
+  Returns:
+    integer representing how much data is remaining in the buffer.
+  """
+  current_position = input_buffer.tell()
+  input_buffer.seek(0, 2)
+  remaining_data_size = input_buffer.tell() - current_position
+  input_buffer.seek(current_position)
+  return remaining_data_size
+
+
+def ContentLengthRewriter(response, request_headers, env_dict):
   """Rewrite the Content-Length header.
 
   Even though Content-Length is not a user modifiable header, App Engine
   sends a correct Content-Length to the user based on the actual response.
   """
 
+  if env_dict and env_dict.get('REQUEST_METHOD', '') == 'HEAD':
+    return
+
+
   if response.status_code != httplib.NOT_MODIFIED:
-    current_position = response.body.tell()
-    response.body.seek(0, 2)
 
 
-
-    response.headers['Content-Length'] = str(response.body.tell() -
-                                             current_position)
-    response.body.seek(current_position)
+    response.headers['Content-Length'] = str(_RemainingDataSize(response.body))
   elif 'Content-Length' in response.headers:
     del response.headers['Content-Length']
 
@@ -2249,9 +2447,10 @@ def CreateResponseRewritersChain():
   Returns:
     List of response rewriters.
   """
-  rewriters = [dev_appserver_blobstore.DownloadRewriter,
+  rewriters = [ParseStatusRewriter,
+               dev_appserver_blobstore.DownloadRewriter,
                IgnoreHeadersRewriter,
-               ParseStatusRewriter,
+               ValidHeadersRewriter,
                CacheRewriter,
                ContentLengthRewriter,
               ]
@@ -2261,7 +2460,8 @@ def CreateResponseRewritersChain():
 
 def RewriteResponse(response_file,
                     response_rewriters=None,
-                    request_headers=None):
+                    request_headers=None,
+                    env_dict=None):
   """Allows final rewrite of dev_appserver response.
 
   This function receives the unparsed HTTP response from the application
@@ -2279,6 +2479,7 @@ def RewriteResponse(response_file,
     response_rewriters: A list of response rewriters.  If none is provided it
       will create a new chain using CreateResponseRewritersChain.
     request_headers: Original request headers.
+    env_dict: Environment dictionary.
 
   Returns:
     An AppServerResponse instance configured with the rewritten response.
@@ -2292,8 +2493,10 @@ def RewriteResponse(response_file,
 
     if response_rewriter.func_code.co_argcount == 1:
       response_rewriter(response)
-    else:
+    elif response_rewriter.func_code.co_argcount == 2:
       response_rewriter(response, request_headers)
+    else:
+      response_rewriter(response, request_headers, env_dict)
 
   return response
 
@@ -2329,6 +2532,9 @@ class ModuleManager(object):
 
 
     self._modification_times = {}
+
+
+    self._dirty = True
 
   @staticmethod
   def GetModuleFile(module, is_file=os.path.isfile):
@@ -2367,18 +2573,25 @@ class ModuleManager(object):
 
       module = self._modules[name]
 
+      try:
 
-      if not os.path.isfile(fname):
-        return True
+        if mtime != os.path.getmtime(fname):
+          self._dirty = True
+          return True
+      except OSError, e:
 
-
-      if mtime != os.path.getmtime(fname):
-        return True
+        if e.errno in FILE_MISSING_EXCEPTIONS:
+          self._dirty = True
+          return True
+        raise e
 
     return False
 
   def UpdateModuleFileModificationTimes(self):
     """Records the current modification times of all monitored modules."""
+    if not self._dirty:
+      return
+
     self._modification_times.clear()
     for name, module in self._modules.items():
       if not isinstance(module, types.ModuleType):
@@ -2392,6 +2605,8 @@ class ModuleManager(object):
       except OSError, e:
         if e.errno not in FILE_MISSING_EXCEPTIONS:
           raise e
+
+    self._dirty = False
 
   def ResetModules(self):
     """Clear modules so that when request is run they are reloaded."""
@@ -2461,11 +2676,10 @@ def _ClearTemplateCache(module_dict=sys.modules):
 
 def CreateRequestHandler(root_path,
                          login_url,
-                         require_indexes=False,
                          static_caching=True,
                          default_partition=None,
                          persist_logs=False,
-                         secret_hash='xxx'):
+                         interactive_console=True):
   """Creates a new BaseHTTPRequestHandler sub-class.
 
   This class will be used with the Python BaseHTTPServer module's HTTP server.
@@ -2478,9 +2692,10 @@ def CreateRequestHandler(root_path,
   Args:
     root_path: Path to the root of the application running on the server.
     login_url: Relative URL which should be used for handling user logins.
-    require_indexes: True if index.yaml is read-only gospel; default False.
     static_caching: True if browser caching of static files should be allowed.
     default_partition: Default partition to use in the application id.
+    persist_logs: If true, log records should be durably persisted.
+    interactive_console: Whether to add the interactive console.
 
   Returns:
     Sub-class of BaseHTTPRequestHandler.
@@ -2508,14 +2723,6 @@ def CreateRequestHandler(root_path,
   application_module_dict = SetupSharedModules(sys.modules)
 
 
-  if require_indexes:
-
-    index_yaml_updater = None
-  else:
-
-    index_yaml_updater = dev_appserver_index.IndexYamlUpdater(root_path)
-
-
   application_config_cache = AppConfigCache()
 
   class DevAppServerRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -2535,7 +2742,7 @@ def CreateRequestHandler(root_path,
     application configuration file in the directory specified by the root_path
     argument is invalid.
     """
-    server_version = 'AppScaleServer/1.6'
+    server_version = 'Development/1.0'
 
 
 
@@ -2548,6 +2755,8 @@ def CreateRequestHandler(root_path,
 
     rewriter_chain = CreateResponseRewritersChain()
 
+    channel_poll_path_re = re.compile(
+        dev_appserver_channel.CHANNEL_POLL_PATTERN)
 
     def __init__(self, *args, **kwargs):
       """Initializer.
@@ -2629,8 +2838,9 @@ def CreateRequestHandler(root_path,
 
       request_descriptor, request_file_name = tempfile.mkstemp('.tmp',
                                                                'request.')
+
       try:
-        request_file = os.fdopen(request_descriptor, 'wb')
+        request_file = open(request_file_name, 'wb')
         try:
           CopyStreamPart(self.rfile,
                          request_file,
@@ -2643,8 +2853,7 @@ def CreateRequestHandler(root_path,
           app_server_request = AppServerRequest(self.path,
                                                 None,
                                                 self.headers,
-                                                request_file,
-                                                secret_hash)
+                                                request_file)
           dispatcher.Dispatch(app_server_request,
                               outfile,
                               base_env_dict=env_dict)
@@ -2652,7 +2861,17 @@ def CreateRequestHandler(root_path,
           request_file.close()
       finally:
         try:
-          os.remove(request_file_name)
+          os.close(request_descriptor)
+
+
+
+          try:
+            os.remove(request_file_name)
+          except OSError, err:
+            if getattr(err, 'winerror', 0) == os_compat.ERROR_SHARING_VIOLATION:
+              logging.warning('Failed removing %s', request_file_name)
+            else:
+              raise
         except OSError, err:
           if err.errno != errno.ENOENT:
             raise
@@ -2667,7 +2886,7 @@ def CreateRequestHandler(root_path,
 
       env_dict = {
           'REQUEST_METHOD': self.command,
-          'REMOTE_ADDR': self.headers.get("X-Real-IP", self.client_address[0]),
+          'REMOTE_ADDR': self.client_address[0],
           'SERVER_SOFTWARE': self.server_version,
           'SERVER_NAME': server_name,
           'SERVER_PROTOCOL': self.protocol_version,
@@ -2689,7 +2908,7 @@ def CreateRequestHandler(root_path,
           static_caching=static_caching, default_partition=default_partition)
 
 
-        if not from_cache or self.module_manager.AreModuleFilesModified():
+        if not from_cache:
           self.module_manager.ResetModules()
 
 
@@ -2698,6 +2917,15 @@ def CreateRequestHandler(root_path,
                                                  self.module_dict,
                                                  root_path,
                                                  login_url)
+
+        if self.path.startswith('/_ah/admin'):
+
+
+          if any((handler.url == '/_ah/datastore_admin.*'
+                  for handler in config.handlers)):
+            self.headers['X-AppEngine-Datastore-Admin-Enabled'] = 'True'
+          self.headers['X-AppEngine-Interactive-Console-Enabled'] = str(
+              interactive_console)
 
         if config.api_version != API_VERSION:
           logging.error(
@@ -2723,13 +2951,13 @@ def CreateRequestHandler(root_path,
         env_dict['SDK_VERSION'] = version['release']
         env_dict['CURRENT_VERSION_ID'] = config.version + ".1"
         env_dict['APPLICATION_ID'] = config.application
+        env_dict['DEFAULT_VERSION_HOSTNAME'] = self.server.frontend_hostport
         env_dict['APPENGINE_RUNTIME'] = config.runtime
         if config.runtime == 'python27' and config.threadsafe:
           env_dict['_AH_THREADSAFE'] = '1'
 
 
 
-        global _request_id
         request_id_hash = _generate_request_id_hash()
         env_dict['REQUEST_ID_HASH'] = request_id_hash
         os.environ['REQUEST_ID_HASH'] = request_id_hash
@@ -2738,7 +2966,8 @@ def CreateRequestHandler(root_path,
         multiprocess.GlobalProcess().UpdateEnv(env_dict)
 
         cookies = ', '.join(self.headers.getheaders('cookie'))
-        email_addr, user_id, admin, valid_cookie = dev_appserver_login.GetUserInfo(cookies)
+        email_addr, admin, user_id = dev_appserver_login.GetUserInfo(cookies)
+
         self._log_record_writer.write_request_info(
             ip=env_dict['REMOTE_ADDR'],
             app_id=env_dict['APPLICATION_ID'],
@@ -2747,11 +2976,8 @@ def CreateRequestHandler(root_path,
             user_agent=self.headers.get('user-agent'),
             host=host_name)
 
-        dispatcher = MatcherDispatcher(config, login_url,
+        dispatcher = MatcherDispatcher(config, login_url, self.module_manager,
                                        [implicit_matcher, explicit_matcher])
-
-
-        dev_appserver_index.SetupIndexes(config.application, root_path)
 
 
 
@@ -2768,33 +2994,29 @@ def CreateRequestHandler(root_path,
         outfile.flush()
         outfile.seek(0)
 
-        response = RewriteResponse(outfile, self.rewriter_chain, self.headers)
+        response = RewriteResponse(outfile, self.rewriter_chain, self.headers,
+                                   env_dict)
 
-        if not response.large_response:
-
-          position = response.body.tell()
-          response.body.seek(0, 2)
-          end = response.body.tell()
-          response.body.seek(position)
-          runtime_response_size = end - position
-
-          if runtime_response_size > MAX_RUNTIME_RESPONSE_SIZE:
-            logging.error('Response too large: %d, max is %d',
-                          runtime_response_size, MAX_RUNTIME_RESPONSE_SIZE)
-
-
-            response.status_code = 500
-            response.status_message = 'Forbidden'
+        runtime_response_size = _RemainingDataSize(response.body)
+        if self.command == 'HEAD' and runtime_response_size > 0:
+          logging.warning('Dropping unexpected body in response to HEAD '
+                          'request')
+          response.body = cStringIO.StringIO('')
+        elif (not response.large_response and
+              runtime_response_size > MAX_RUNTIME_RESPONSE_SIZE):
+          logging.error('Response too large: %d, max is %d',
+                        runtime_response_size, MAX_RUNTIME_RESPONSE_SIZE)
 
 
-            if 'content-length' in response.headers:
-              del response.headers['content-length']
-            new_response = ('HTTP response was too large: %d.  '
-                            'The limit is: %d.'
-                            % (runtime_response_size,
-                               MAX_RUNTIME_RESPONSE_SIZE))
-            response.headers['content-length'] = str(len(new_response))
-            response.body = cStringIO.StringIO(new_response)
+          response.status_code = 500
+          response.status_message = 'Forbidden'
+
+          new_response = ('HTTP response was too large: %d.  '
+                          'The limit is: %d.'
+                          % (runtime_response_size,
+                             MAX_RUNTIME_RESPONSE_SIZE))
+          response.headers['Content-Length'] = str(len(new_response))
+          response.body = cStringIO.StringIO(new_response)
 
 
         multiprocess.GlobalProcess().RequestComplete(self, response)
@@ -2818,6 +3040,15 @@ def CreateRequestHandler(root_path,
         self.send_response(httplib.INTERNAL_SERVER_ERROR, 'Compile error')
         self.wfile.write('Content-Type: text/plain; charset=utf-8\r\n\r\n')
         self.wfile.write(msg)
+      except ExecuteError, e:
+        logging.error(e.text)
+        self.send_response(httplib.INTERNAL_SERVER_ERROR, 'Execute error')
+        self.wfile.write('Content-Type: text/html; charset=utf-8\r\n\r\n')
+        self.wfile.write('<title>App failure</title>\n')
+        self.wfile.write(e.text + '\n<pre>\n')
+        for l in e.log:
+          self.wfile.write(cgi.escape(l))
+        self.wfile.write('</pre>\n')
       except:
         msg = 'Exception encountered handling request'
         logging.exception(msg)
@@ -2828,12 +3059,8 @@ def CreateRequestHandler(root_path,
           self.send_response(response.status_code, response.status_message)
           self.wfile.write(response.header_data)
           self.wfile.write('\r\n')
-          if self.command != 'HEAD':
 
-            shutil.copyfileobj(response.body, self.wfile, COPY_BLOCK_SIZE)
-          elif response.body:
-            logging.warning('Dropping unexpected body in response '
-                            'to HEAD request')
+          shutil.copyfileobj(response.body, self.wfile, COPY_BLOCK_SIZE)
         except (IOError, OSError), e:
 
 
@@ -2848,13 +3075,8 @@ def CreateRequestHandler(root_path,
           if e.errno not in [errno.EPIPE, os_compat.WSAECONNABORTED]:
             raise e
         except socket.error, e:
-          logging.error("Socket exception: %s"%str(e))
-          # Temp fix to prevent the AS from locking up
-          self.server.stop_serving_forever()
-          #sys.exit(0)
-          #if len(e.args) >= 1 and e.args[0] != errno.EPIPE:
-          #  raise e
-          #raise
+          if len(e.args) >= 1 and e.args[0] != errno.EPIPE:
+            raise e
 
     def log_error(self, format, *args):
       """Redirect error messages through the logging module."""
@@ -2862,7 +3084,12 @@ def CreateRequestHandler(root_path,
 
     def log_message(self, format, *args):
       """Redirect log messages through the logging module."""
-      logging.info(format, *args)
+
+
+      if hasattr(self, 'path') and self.channel_poll_path_re.match(self.path):
+        logging.debug(format, *args)
+      else:
+        logging.info(format, *args)
 
     def log_request(self, code='-', size='-'):
       """Indicate that this request has completed."""
@@ -2905,6 +3132,34 @@ def ReadAppConfig(appinfo_path, parse_app_config=appinfo_includes.Parse):
     return parse_app_config(appinfo_file)
   finally:
     appinfo_file.close()
+
+
+def _StaticFilePathRe(url_map):
+  """Returns a regular expression string that matches static file paths.
+
+  Args:
+    url_map: A fully initialized static_files or static_dir appinfo.URLMap
+      instance.
+
+  Returns:
+    The regular expression matches paths, relative to the application's root
+    directory, of files that this static handler serves. re.compile should
+    accept the returned string.
+
+  Raises:
+    AssertionError: The url_map argument was not an URLMap for a static handler.
+  """
+  handler_type = url_map.GetHandlerType()
+
+
+  if handler_type == 'static_files':
+    return url_map.upload + '$'
+
+  elif handler_type == 'static_dir':
+    path = url_map.static_dir.rstrip(os.path.sep)
+    return path + re.escape(os.path.sep) + r'(.*)'
+
+  assert False, 'This property only applies to static handlers.'
 
 
 def CreateURLMatcherFromMaps(config,
@@ -2953,7 +3208,6 @@ def CreateURLMatcherFromMaps(config,
   cgi_dispatcher = create_cgi_dispatcher(config, module_dict,
                                          root_path, path_adjuster)
   static_file_config_matcher = StaticFileConfigMatcher(url_map_list,
-                                                       path_adjuster,
                                                        default_expiration)
   file_dispatcher = create_file_dispatcher(config, path_adjuster,
                                            static_file_config_matcher)
@@ -3064,43 +3318,41 @@ def LoadAppConfig(root_path,
         cache.config = cache.matcher = cache.path = None
         cache.mtime = mtime
 
-      try:
-        config = read_app_config(appinfo_path, appinfo_includes.Parse)
-        # Comment this out because otherwise it adds "~dev" to the appname
-        #if config.application:
-        #  config.application = AppIdWithDefaultPartition(config.application,
-        #                                                 default_partition)
-        multiprocess.GlobalProcess().NewAppInfo(config)
+      config = read_app_config(appinfo_path, appinfo_includes.Parse)
 
-        if static_caching:
-          if config.default_expiration:
-            default_expiration = config.default_expiration
-          else:
+      if config.application:
+        config.application = AppIdWithDefaultPartition(config.application,
+                                                       default_partition)
+      multiprocess.GlobalProcess().NewAppInfo(config)
 
-
-            default_expiration = '0'
+      if static_caching:
+        if config.default_expiration:
+          default_expiration = config.default_expiration
         else:
 
-          default_expiration = None
 
-        matcher = create_matcher(config,
-                                 root_path,
-                                 config.handlers,
-                                 module_dict,
-                                 default_expiration)
+          default_expiration = '0'
+      else:
 
-        FakeFile.SetSkippedFiles(config.skip_files)
+        default_expiration = None
 
-        if cache is not None:
-          cache.path = appinfo_path
-          cache.config = config
-          cache.matcher = matcher
+      matcher = create_matcher(config,
+                               root_path,
+                               config.handlers,
+                               module_dict,
+                               default_expiration)
 
-        return (config, matcher, False)
-      except gexcept.AbstractMethod:
-        pass
+      FakeFile.SetSkippedFiles(config.skip_files)
 
-  raise AppConfigNotFoundError
+      if cache is not None:
+        cache.path = appinfo_path
+        cache.config = config
+        cache.matcher = matcher
+
+      return config, matcher, False
+
+  raise AppConfigNotFoundError(
+      'Could not find app.yaml in "%s".' % (root_path,))
 
 
 class ReservedPathFilter():
@@ -3158,6 +3410,15 @@ def ReadCronConfig(croninfo_path, parse_cron_config=croninfo.LoadSingleCron):
 
 
 
+def _RemoveFile(file_path):
+  if file_path and os.path.lexists(file_path):
+    logging.info('Attempting to remove file at %s', file_path)
+    try:
+      os.remove(file_path)
+    except OSError, e:
+      logging.warning('Removing file failed: %s', e)
+
+
 def SetupStubs(app_id, **config):
   """Sets up testing stubs of APIs.
 
@@ -3201,7 +3462,12 @@ def SetupStubs(app_id, **config):
     port: The port that this dev_appserver is bound to. Defaults to 8080
     address: The host that this dev_appsever is running on. Defaults to
       localhost.
+    search_index_path: Path to the file to store search indexes in.
+    clear_search_index: If the search indeces should be cleared on startup.
   """
+
+
+
 
   root_path = config.get('root_path', None)
   login_url = config['login_url']
@@ -3229,14 +3495,13 @@ def SetupStubs(app_id, **config):
   task_retry_seconds = config.get('task_retry_seconds', 30)
   persist_logs = config.get('persist_logs', False)
   trusted = config.get('trusted', False)
-  serve_port = int(config.get('NGINX_PORT', 8080))
-  serve_address = config.get('NGINX_HOST', 'localhost')
-  xmpp_path = config['xmpp_path']
-  uaserver_path = config['uaserver_path']
-  login_server = config['login_server']
-  cookie_secret= config['COOKIE_SECRET'] 
-  #serve_port = config.get('port', 8080)
- # serve_address = config.get('address', 'localhost')
+  serve_port = config.get('port', 8080)
+  serve_address = config.get('address', 'localhost')
+  clear_search_index = config.get('clear_search_indexes', False)
+  search_index_path = config.get('search_indexes_path', None)
+  _use_atexit_for_datastore_stub = config.get('_use_atexit_for_datastore_stub',
+                                              False)
+  port_sqlite_data = config.get('port_sqlite_data', False)
 
 
 
@@ -3249,93 +3514,113 @@ def SetupStubs(app_id, **config):
   os.environ['REQUEST_ID_HASH'] = ''
 
   if clear_prospective_search and prospective_search_path:
-
-    if os.path.lexists(prospective_search_path):
-      logging.info('Attempting to remove file at %s', prospective_search_path)
-      try:
-        remove(prospective_search_path)
-      except OSError, e:
-        logging.warning('Removing file failed: %s', e)
+    _RemoveFile(prospective_search_path)
 
   if clear_datastore:
-    path = datastore_path
+    _RemoveFile(datastore_path)
 
-    if os.path.lexists(path):
-      logging.info('Attempting to remove file at %s', path)
-      try:
-        remove(path)
-      except OSError, e:
-        logging.warning('Removing file failed: %s', e)
+  if clear_search_index:
+    _RemoveFile(search_index_path)
 
 
   if not multiprocess.GlobalProcess().MaybeConfigureRemoteDataApis():
-    """Configures local versions of datastore, memcache, and taskqueue."""
+
+
+
+
+
+
     apiproxy_stub_map.apiproxy = apiproxy_stub_map.APIProxyStubMap()
 
-    datastore = datastore_distributed.DatastoreDistributed(
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'app_identity_service',
+        app_identity_stub.AppIdentityServiceStub())
+
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'capability_service',
+        capability_stub.CapabilityServiceStub())
+
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'conversion',
+        conversion_stub.ConversionServiceStub())
+
+    if use_sqlite:
+      if port_sqlite_data:
+        try:
+          PortAllEntities(datastore_path)
+        except Error:
+          logging.Error("Porting the data from the datastore file stub failed")
+          raise
+
+      datastore = datastore_sqlite_stub.DatastoreSqliteStub(
+            app_id, datastore_path, require_indexes=require_indexes,
+            trusted=trusted, root_path=root_path,
+            use_atexit=_use_atexit_for_datastore_stub)
+    else:
+      logging.warning(FILE_STUB_DEPRECATION_MESSAGE)
+      datastore = datastore_file_stub.DatastoreFileStub(
           app_id, datastore_path, require_indexes=require_indexes,
-          trusted=trusted)
+          trusted=trusted, root_path=root_path,
+          use_atexit=_use_atexit_for_datastore_stub)
 
     if high_replication:
       datastore.SetConsistencyPolicy(
           datastore_stub_util.TimeBasedHRConsistencyPolicy())
-    apiproxy_stub_map.apiproxy.RegisterStub(
+    apiproxy_stub_map.apiproxy.ReplaceStub(
         'datastore_v3', datastore)
 
     apiproxy_stub_map.apiproxy.RegisterStub(
-        'memcache',
-        memcache_distributed.MemcacheService())
+        'mail',
+        mail_stub.MailServiceStub(smtp_host,
+                                  smtp_port,
+                                  smtp_user,
+                                  smtp_password,
+                                  enable_sendmail=enable_sendmail,
+                                  show_mail_body=show_mail_body))
 
-    hash_secret = hashlib.sha1(app_id + '/'+ cookie_secret).hexdigest()
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'memcache',
+        memcache_stub.MemcacheServiceStub())
+
     apiproxy_stub_map.apiproxy.RegisterStub(
         'taskqueue',
-        taskqueue_rabbitmq.TaskQueueServiceStub(
+        taskqueue_stub.TaskQueueServiceStub(
             root_path=root_path,
             auto_task_running=(not disable_task_running),
             task_retry_seconds=task_retry_seconds,
-            default_http_server='%s:%s' % (serve_address, serve_port), app_id=app_id, hash_secret=hash_secret))
+            default_http_server='%s:%s' % (serve_address, serve_port)))
 
-    if mysql_user:
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'urlfetch',
+        urlfetch_stub.URLFetchServiceStub())
+
+    apiproxy_stub_map.apiproxy.RegisterStub(
+        'xmpp',
+        xmpp_service_stub.XmppServiceStub())
 
 
 
-      from google.appengine import api
-      sys.modules['google.appengine.api.rdbms'] = rdbms_mysqldb
-      api.rdbms = rdbms_mysqldb
-      rdbms_mysqldb.SetConnectKwargs(host=mysql_host, port=mysql_port,
-                                     user=mysql_user, passwd=mysql_password,
-                                     unix_socket=mysql_socket)
-      rdbms_mysqldb.connect(database='')
+
+  from google.appengine import api
+  sys.modules['google.appengine.api.rdbms'] = rdbms_mysqldb
+  api.rdbms = rdbms_mysqldb
+  rdbms_mysqldb.SetConnectKwargs(host=mysql_host, port=mysql_port,
+                                 user=mysql_user, passwd=mysql_password,
+                                 unix_socket=mysql_socket)
 
   fixed_login_url = '%s?%s=%%s' % (login_url,
                                    dev_appserver_login.CONTINUE_PARAM)
-  fixed_logout_url = 'http://%s/logout' % login_server
+  fixed_logout_url = '%s&%s' % (fixed_login_url,
+                                dev_appserver_login.LOGOUT_PARAM)
+
+
+
+
 
   apiproxy_stub_map.apiproxy.RegisterStub(
       'user',
       user_service_stub.UserServiceStub(login_url=fixed_login_url,
                                         logout_url=fixed_logout_url))
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'urlfetch',
-      urlfetch_stub.URLFetchServiceStub())
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'mail',
-      mail_stub.MailServiceStub(smtp_host,
-                                smtp_port,
-                                smtp_user,
-                                smtp_password,
-                                enable_sendmail=enable_sendmail,
-                                show_mail_body=show_mail_body))
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'capability_service',
-      capability_stub.CapabilityServiceStub())
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'xmpp',
-      xmpp_service_real.XmppService(domain=xmpp_path, uaserver=uaserver_path))
 
   apiproxy_stub_map.apiproxy.RegisterStub(
       'channel',
@@ -3348,12 +3633,8 @@ def SetupStubs(app_id, **config):
           apiproxy_stub_map.apiproxy.GetStub('taskqueue')))
 
   apiproxy_stub_map.apiproxy.RegisterStub(
-      'app_identity_service',
-      app_identity_stub.AppIdentityServiceStub())
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
       'search',
-      simple_search_stub.SearchServiceStub())
+      simple_search_stub.SearchServiceStub(index_file=search_index_path))
 
 
 
@@ -3362,10 +3643,6 @@ def SetupStubs(app_id, **config):
 
 
 
-
-  apiproxy_stub_map.apiproxy.RegisterStub(
-      'conversion',
-      conversion_stub.ConversionServiceStub())
 
   try:
     from google.appengine.api.images import images_stub
@@ -3382,7 +3659,7 @@ def SetupStubs(app_id, **config):
         'images',
         images_not_implemented_stub.ImagesNotImplementedServiceStub())
 
-  blob_storage = datastore_blob_storage.DatastoreBlobStorage(blobstore_path, app_id)
+  blob_storage = file_blob_storage.FileBlobStorage(blobstore_path, app_id)
   apiproxy_stub_map.apiproxy.RegisterStub(
       'blobstore',
       blobstore_stub.BlobstoreServiceStub(blob_storage))
@@ -3400,6 +3677,22 @@ def SetupStubs(app_id, **config):
   apiproxy_stub_map.apiproxy.RegisterStub('system', system_service_stub)
 
 
+def TearDownStubs():
+  """Clean up any stubs that need cleanup."""
+
+  datastore_stub = apiproxy_stub_map.apiproxy.GetStub('datastore_v3')
+
+
+  if isinstance(datastore_stub, datastore_stub_util.BaseTransactionManager):
+    logging.info('Applying all pending transactions and saving the datastore')
+    datastore_stub.Write()
+
+  search_stub = apiproxy_stub_map.apiproxy.GetStub('search')
+  if isinstance(search_stub, simple_search_stub.SearchServiceStub):
+    logging.info('Saving search indexes')
+    search_stub.Write()
+
+
 def CreateImplicitMatcher(
     config,
     module_dict,
@@ -3412,14 +3705,14 @@ def CreateImplicitMatcher(
   """Creates a URLMatcher instance that handles internal URLs.
 
   Used to facilitate handling user login/logout, debugging, info about the
-  currently running app, etc.
+  currently running app, quitting the dev appserver, etc.
 
   Args:
     config: AppInfoExternal instance representing the parsed app.yaml file.
     module_dict: Dictionary in the form used by sys.modules.
     root_path: Path to the root of the application.
     login_url: Relative URL which should be used for handling user login/logout.
-    create_path_adjuster: Used for dependedency injection.
+      create_path_adjuster: Used for dependedency injection.
     create_local_dispatcher: Used for dependency injection.
     create_cgi_dispatcher: Used for dependedency injection.
     get_blob_storage: Used for dependency injection.
@@ -3431,15 +3724,18 @@ def CreateImplicitMatcher(
   path_adjuster = create_path_adjuster(root_path)
 
 
-  if multiprocess.GlobalProcess().IsApiServer():
-    remote_api_dispatcher = create_cgi_dispatcher(
-        config, module_dict, root_path, path_adjuster)
-    url_matcher.AddURL(multiprocess.PATH_DEV_API_SERVER,
-                       remote_api_dispatcher,
-                       REMOTE_API_PATH,
-                       False,
-                       False,
-                       appinfo.AUTH_FAIL_ACTION_REDIRECT)
+
+
+  def _HandleQuit():
+    raise KeyboardInterrupt
+  quit_dispatcher = create_local_dispatcher(config, sys.modules, path_adjuster,
+                                            _HandleQuit)
+  url_matcher.AddURL('/_ah/quit?',
+                     quit_dispatcher,
+                     '',
+                     False,
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_REDIRECT)
 
 
 
@@ -3458,8 +3754,8 @@ def CreateImplicitMatcher(
   url_matcher.AddURL('/_ah/admin(?:/.*)?',
                      admin_dispatcher,
                      DEVEL_CONSOLE_PATH,
-                     True,
-                     True,
+                     False,
+                     False,
                      appinfo.AUTH_FAIL_ACTION_REDIRECT)
 
   upload_dispatcher = dev_appserver_blobstore.CreateUploadDispatcher(
@@ -3468,8 +3764,8 @@ def CreateImplicitMatcher(
   url_matcher.AddURL(dev_appserver_blobstore.UPLOAD_URL_PATTERN,
                      upload_dispatcher,
                      '',
-                     True,
-                     True,
+                     False,
+                     False,
                      appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED)
 
   blobimage_dispatcher = dev_appserver_blobimage.CreateBlobImageDispatcher(
@@ -3493,6 +3789,13 @@ def CreateImplicitMatcher(
   channel_dispatcher = dev_appserver_channel.CreateChannelDispatcher(
       apiproxy_stub_map.apiproxy.GetStub('channel'))
 
+  url_matcher.AddURL(dev_appserver_channel.CHANNEL_POLL_PATTERN,
+                     channel_dispatcher,
+                     '',
+                     False,
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED)
+
   url_matcher.AddURL(dev_appserver_channel.CHANNEL_JSAPI_PATTERN,
                      channel_dispatcher,
                      '',
@@ -3500,8 +3803,68 @@ def CreateImplicitMatcher(
                      False,
                      appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED)
 
+  apiserver_dispatcher = dev_appserver_apiserver.CreateApiserverDispatcher()
+  url_matcher.AddURL(dev_appserver_apiserver.API_SERVING_PATTERN,
+                     apiserver_dispatcher,
+                     '',
+                     False,
+                     False,
+                     appinfo.AUTH_FAIL_ACTION_UNAUTHORIZED)
 
   return url_matcher
+
+
+def FetchAllEntitites():
+  """Returns all datastore entities from all namespaces as a list."""
+  ns = list(datastore.Query('__namespace__').Run())
+  original_ns = namespace_manager.get_namespace()
+  entities_set = []
+  for namespace in ns:
+    namespace_manager.set_namespace(namespace.key().name())
+    kinds_list = list(datastore.Query('__kind__').Run())
+    for kind_entity in kinds_list:
+      ents = list(datastore.Query(kind_entity.key().name()).Run())
+      for ent in ents:
+        entities_set.append(ent)
+  namespace_manager.set_namespace(original_ns)
+  return entities_set
+
+
+def PutAllEntities(entities):
+  """Puts all entities to the current datastore."""
+  for entity in entities:
+    datastore.Put(entity)
+
+
+def PortAllEntities(datastore_path):
+  """Copies entities from a DatastoreFileStub to an SQLite stub.
+
+  Args:
+    datastore_path: Path to the file to store Datastore file stub data is.
+  """
+
+  previous_stub = apiproxy_stub_map.apiproxy.GetStub('datastore_v3')
+
+  try:
+    app_id = os.environ['APPLICATION_ID']
+    apiproxy_stub_map.apiproxy = apiproxy_stub_map.APIProxyStubMap()
+    datastore_stub = datastore_file_stub.DatastoreFileStub(
+        app_id, datastore_path, trusted=True)
+    apiproxy_stub_map.apiproxy.RegisterStub('datastore_v3', datastore_stub)
+
+    entities = FetchAllEntitites()
+    sqlite_datastore_stub = datastore_sqlite_stub.DatastoreSqliteStub(app_id,
+                            datastore_path + '.sqlite', trusted=True)
+    apiproxy_stub_map.apiproxy.ReplaceStub('datastore_v3',
+                                           sqlite_datastore_stub)
+    PutAllEntities(entities)
+    sqlite_datastore_stub.Close()
+  finally:
+    apiproxy_stub_map.apiproxy.ReplaceStub('datastore_v3', previous_stub)
+
+  shutil.copy(datastore_path, datastore_path + '.filestub')
+  _RemoveFile(datastore_path)
+  shutil.move(datastore_path + '.sqlite', datastore_path)
 
 
 def CreateServer(root_path,
@@ -3509,15 +3872,15 @@ def CreateServer(root_path,
                  port,
                  template_dir=None,
                  serve_address='',
-                 require_indexes=False,
                  allow_skipped_files=False,
                  static_caching=True,
                  python_path_list=sys.path,
                  sdk_dir=SDK_ROOT,
                  default_partition=None,
                  persist_logs=False,
-                 secret_hash="xxx"):
-  """Creates an new HTTPServer for an application.
+                 frontend_port=None,
+                 interactive_console=True):
+  """Creates a new HTTPServer for an application.
 
   The sdk_dir argument must be specified for the directory storing all code for
   the SDK so as to allow for the sandboxing of module access to work for any
@@ -3531,16 +3894,20 @@ def CreateServer(root_path,
     port: Port to start the application server on.
     template_dir: Unused.
     serve_address: Address on which the server should serve.
-    require_indexes: True if index.yaml is read-only gospel; default False.
     allow_skipped_files: True if skipped files should be accessible.
     static_caching: True if browser caching of static files should be allowed.
     python_path_list: Used for dependency injection.
     sdk_dir: Directory where the SDK is stored.
     default_partition: Default partition to use for the appid.
-    secret_hash: For TaskQueue admin rights
+    persist_logs: If true, log records should be durably persisted.
+    frontend_port: A frontend port (so backends can return an address for a
+      frontend). If None, port will be used.
+    interactive_console: Whether to add the interactive console.
+
   Returns:
     Instance of BaseHTTPServer.HTTPServer that's ready to start accepting.
   """
+
 
 
 
@@ -3553,11 +3920,10 @@ def CreateServer(root_path,
 
   handler_class = CreateRequestHandler(absolute_root_path,
                                        login_url,
-                                       require_indexes,
                                        static_caching,
                                        default_partition,
                                        persist_logs,
-                                       secret_hash)
+                                       interactive_console)
 
 
   if absolute_root_path not in python_path_list:
@@ -3581,6 +3947,9 @@ def CreateServer(root_path,
   if channel_stub:
     channel_stub._add_event = server.AddEvent
     channel_stub._update_event = server.UpdateEvent
+
+  server.frontend_hostport = '%s:%d' % (serve_address or 'localhost',
+                                        frontend_port or port)
 
   return server
 
@@ -3646,19 +4015,6 @@ class HTTPServerWithScheduler(BaseHTTPServer.HTTPServer):
     """Handle one request at a time until told to stop."""
     while not self._stopped:
       self.handle_request()
-
-      # AppScale 
-      # If this process is using too much memory kill it randomly
-      if resource.getrusage(resource.RUSAGE_SELF).ru_maxrss > SOFT_CAP_MEM:
-        # Stagger the killing so all processes do not go down at the same 
-        # time. The lower the MAX_RANDOM_TARGET the higher probability it 
-        # will shut down when over the soft memory cap.
-        rand = random.randint(0,MAX_RANDOM_TARGET)
-        if rand == 0: 
-          logging.error("Usage of memory exceeded soft cap of " + \
-                        str(SOFT_CAP_MEM) + ". Exiting.")
-          break
-
     self.server_close()
 
   def stop_serving_forever(self):
