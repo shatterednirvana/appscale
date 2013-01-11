@@ -330,6 +330,11 @@ _SUPPORTED_LIBRARIES = [
         'A library for creating and transforming images.',
         ['1.1.7']),
     _VersionedLibrary(
+        'pygments',
+        'http://pygments.org/',
+        'A library for highlighting syntax.',
+        ['1.6rc1']),
+    _VersionedLibrary(
         'PyAMF',
         'http://www.pyamf.org/',
         'A library that provides (AMF) Action Message Format functionality.',

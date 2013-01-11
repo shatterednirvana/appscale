@@ -95,6 +95,17 @@ installPIL()
     rm -fdr Imaging-1.1.7*
 }
 
+installpygments()
+{
+    mkdir -pv ${APPSCALE_HOME}/downloads
+    cd ${APPSCALE_HOME}/downloads
+    hg clone http://bitbucket.org/birkenfeld/pygments-main pygments
+    cd pygments
+    python2.5 setup.py install
+    cd ..
+    rm -fdr pygments*
+}
+
 patchxmpp()
 {
     PYTHON26_XMPP=/usr/lib/python2.6/dist-packages/xmpp/

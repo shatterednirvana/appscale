@@ -48,6 +48,8 @@ Depends: appscale-tools,
 # TaskQueue
  rabbitmq-server
  python-pip
+# pygments
+ mercurial
 Conflicts: haproxy, zookeeper, zookeeper-bin, zookeeperd, libzookeeper-java, python-zookeeper
 Description: An open-source framework for execution of GAE applications
  An open-source research framework for execution of
