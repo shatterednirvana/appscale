@@ -843,7 +843,7 @@ class Djinn
       return
     end
 
-    start_cmd = "python2.6 #{APPSCALE_HOME}/InfrastructureManager/infrastructure_manager_service.py"
+    start_cmd = "/usr/local/Python-2.7.3/python #{APPSCALE_HOME}/InfrastructureManager/infrastructure_manager_service.py"
     stop_cmd = "pkill -9 infrastructure_manager_service"
     port = [InfrastructureManagerClient::SERVER_PORT]
     env = {
@@ -2306,7 +2306,7 @@ class Djinn
   def start_app_manager_server
     @state = "Starting up AppManager"
     env_vars = {}
-    start_cmd = ["/usr/bin/python2.6 #{APPSCALE_HOME}/AppManager/app_manager_server.py"]
+    start_cmd = ["/usr/local/Python-2.7.3/python #{APPSCALE_HOME}/AppManager/app_manager_server.py"]
     stop_cmd = "pkill -9 app_manager_server"
     port = [AppManagerClient::SERVER_PORT]
     GodInterface.start(:appmanagerserver, start_cmd, stop_cmd, port, env_vars)
