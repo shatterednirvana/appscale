@@ -95,6 +95,17 @@ installPIL()
     rm -fdr Imaging-1.1.7*
 }
 
+installboto()
+{
+    mkdir -pv ${APPSCALE_HOME}/downloads
+    cd ${APPSCALE_HOME}/downloads
+    git clone git://github.com/boto/boto.git
+    cd boto
+    /usr/local/Python-2.7.3/python setup.py install
+    cd ..
+    rm -rf boto
+}
+
 patchxmpp()
 {
     PYTHON26_XMPP=/usr/lib/python2.6/dist-packages/xmpp/
