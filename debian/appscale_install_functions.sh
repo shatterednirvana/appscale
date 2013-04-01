@@ -561,9 +561,13 @@ installnginx()
     tar zxvf nginx-${NGINX_VERSION}.tar.gz || exit 1
     rm -v nginx-${NGINX_VERSION}.tar.gz
     pushd nginx-${NGINX_VERSION}
+    # Grab the chunkin module
     wget http://appscale-build.s3-website-us-east-1.amazonaws.com/v0.23rc2.tar.gz || exit 1
     tar zxvf v0.23rc2.tar.gz || exit 1
-    ./configure --add-module=./chunkin-nginx-module-0.23rc2/ --with-http_ssl_module --with-http_gzip_static_module || exit 1
+    # Grab the more headers module
+    wget http://appscale-build.s3-website-us-east-1.amazonaws.com/v0.19rc1.tar.gz || exit 1
+    tar zxvf v0.19rc1.tar.gz || exit 1
+    ./configure --add-module=./headers-more-nginx-module-0.19rc1/ --add-module=./chunkin-nginx-module-0.23rc2/ --with-http_ssl_module --with-http_gzip_static_module || exit 1
     make || exit 1
     make install || exit 1
     popd
