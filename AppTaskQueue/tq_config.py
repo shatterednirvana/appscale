@@ -186,8 +186,7 @@ queue:
     converted = {'queue':[]}
     for queue in xml_dict['queue-entries']['queue']:
       single_queue = {}
-      for tag in queue:
-        value = queue[tag]
+      for tag, value in queue.iteritems():
         if tag in self.YAML_TO_XML_TAGS_TO_CONVERT:
           tag = tag.replace('-','_')
         if tag == "retry_parameters":
