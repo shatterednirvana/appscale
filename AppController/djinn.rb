@@ -2737,12 +2737,28 @@ class Djinn
 
     if my_node.is_shadow? or my_node.is_appengine?
       ApiChecker.start(get_login.public_ip, @userappserver_private_ip)
+      @app_info_map['apichecker'] = {
+        'nginx' => 8079,
+        'haproxy' => 9999,
+        'appengine' => [19997, 19998, 19999],
+        'language' => 'python'
+      }
+
+      @apps_loaded << "apichecker"
     end
 
     # Start the AppDashboard.
     if my_node.is_login?
       update_node_info_cache()
       start_app_dashboard(get_login.public_ip, @userappserver_private_ip)
+      @app_info_map[AppDashboard::APP_NAME] = {
+        'nginx' => 80,
+        'haproxy' => 8060,
+        'appengine' => [8000, 8001, 8002],
+        'language' => 'python'
+      }
+
+      @apps_loaded << "appscaledashboard"
     end
 
     Djinn.log_info("Starting taskqueue worker for #{AppDashboard::APP_NAME}")
