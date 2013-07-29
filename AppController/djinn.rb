@@ -423,6 +423,11 @@ class Djinn
   LOGS_PER_BATCH = 25
 
 
+  # An Array of Strings, where each String is the appid of a name that AppScale
+  # internally uses.
+  INTERNAL_APPS = ["apichecker", AppDashboard::APP_NAME]
+
+
   # Creates a new Djinn, which holds all the information needed to configure
   # and deploy all the services on this node.
   def initialize()
@@ -4024,7 +4029,9 @@ HOSTS
     if appservers_running > MAX_APPSERVERS_ON_THIS_NODE
       Djinn.log_info("The maximum number of AppServers for this app " +
         "are already running, so don't add any more on this machine.")
-      ZKInterface.request_scale_up_for_app(app_name, my_node.private_ip)
+      if !INTERNAL_APPS.include?(app_name)
+        ZKInterface.request_scale_up_for_app(app_name, my_node.private_ip)
+      end
       return
     end
 
@@ -4048,7 +4055,9 @@ HOSTS
     if appservers_running <= MIN_APPSERVERS_ON_THIS_NODE
       Djinn.log_info("The minimum number of AppServers for this app " +
         "are already running, so don't remove any more off this machine.")
-      ZKInterface.request_scale_down_for_app(app_name, my_node.private_ip)
+      if !INTERNAL_APPS.include?(app_name)
+        ZKInterface.request_scale_down_for_app(app_name, my_node.private_ip)
+      end
       return
     end
 
