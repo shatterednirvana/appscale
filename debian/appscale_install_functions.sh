@@ -280,18 +280,6 @@ postinstallhaproxy()
 
 installgems()
 {
-    # install gem here
-    cd
-    wget $APPSCALE_PACKAGE_MIRROR/rubygems-1.3.7.tgz
-    tar zxvf rubygems-1.3.7.tgz
-    cd rubygems-1.3.7
-    ruby setup.rb
-    cd
-    ln -sf /usr/bin/gem1.8 /usr/bin/gem
-    rm -rf rubygems-1.3.7.tgz
-    rm -rf rubygems-1.3.7
-
-    # gem update
     GEMOPT="--no-rdoc --no-ri"
     # Rake 10.0 depecates rake/rdoctask - upgrade later
     gem install -v=0.9.2.2 rake ${GEMOPT} 
@@ -305,7 +293,6 @@ installgems()
     # This is for the unit testing framework
     gem install -v=1.0.4 flexmock ${GEMOPT}
     gem install -v=1.0.0 rcov ${GEMOPT}
-
 }
 
 postinstallgems()
