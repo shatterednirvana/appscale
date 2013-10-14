@@ -63,7 +63,6 @@ apt-get install -y autoconf automake libtool gcc g++ pkg-config ant maven2\
  dpkg-dev dh-make debhelper fakeroot\
  python-dev libssl-dev\
  libevent-dev\
- ruby1.8-dev\
  zlib1g-dev\
  libexpat1-dev\
  libcppunit-dev\
