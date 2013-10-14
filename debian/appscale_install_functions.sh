@@ -292,6 +292,16 @@ installgems()
     gem install -v=0.8.3 httparty ${GEMOPT}
     # This is for the unit testing framework
     gem install -v=1.0.4 flexmock ${GEMOPT}
+
+    # Finally, SOAP is no longer part of the Ruby core.
+    # Install it separately. Don't install it via gem, since it doesn't work.
+    mkdir -pv ${APPSCALE_HOME}/downloads
+    cd ${APPSCALE_HOME}/downloads
+    git clone https://github.com/spox/soap4r-spox.git
+    cd soap4r-spox
+    ruby setup.rb all
+    cd ..
+    rm -rf soap4r-spox
 }
 
 postinstallgems()
