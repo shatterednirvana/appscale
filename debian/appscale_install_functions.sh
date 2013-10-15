@@ -280,6 +280,9 @@ postinstallhaproxy()
 
 installgems()
 {
+    curl -L https://get.rvm.io | bash -s stable --ruby=1.9.3
+    source /usr/local/rvm/scripts/rvm
+
     GEMOPT="--no-rdoc --no-ri"
     # Rake 10.0 depecates rake/rdoctask - upgrade later
     gem install -v=0.9.2.2 rake ${GEMOPT} 

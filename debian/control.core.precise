@@ -19,7 +19,6 @@ Depends: appscale-tools,
  ejabberd,
 # AppController
  ssh,
- ruby1.9.1-full, rdoc1.9.1, libzip-ruby1.9.1, libruby1.9.1,
  iptables, cron,
  curl, lsof,
  memcached,
