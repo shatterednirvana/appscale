@@ -280,9 +280,17 @@ postinstallhaproxy()
 
 installgems()
 {
+    # Install Ruby 1.9.3 via RVM, since the one from apt has OpenSSL problems.
+    # Since we're installing as root, install RVM only for root.
+    echo 'export rvm_prefix="$HOME"' > /root/.rvmrc
+    echo 'export rvm_path="$HOME/.rvm"' >> /root/.rvmrc
+
+    # Actually install RVM and Ruby 1.9.3.
     curl -L https://get.rvm.io | bash -s stable --ruby=1.9.3
     source /usr/local/rvm/scripts/rvm
+    rvm use 1.9.3 --default
 
+    # Install all gems we need.
     GEMOPT="--no-rdoc --no-ri"
     # Rake 10.0 depecates rake/rdoctask - upgrade later
     gem install -v=0.9.2.2 rake ${GEMOPT} 
