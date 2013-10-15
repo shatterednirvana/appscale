@@ -288,7 +288,7 @@ installgems()
     # Actually install RVM and Ruby 1.9.3.
     curl -L https://get.rvm.io | bash -s stable --ruby=1.9.3
     source /usr/local/rvm/scripts/rvm
-    rvm use 1.9.3 --default
+    rvm --default 1.9.3
 
     # Install all gems we need.
     GEMOPT="--no-rdoc --no-ri"
