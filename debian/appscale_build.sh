@@ -10,7 +10,7 @@ EOF
 
 apt-get -y install lsb-release sudo vim language-pack-en-base
 dpkg-reconfigure locales
-local-gen en_US
+locale-gen en_US
 apt-get install --reinstall locales
 
 export DIST=`lsb_release -c -s`
