@@ -74,6 +74,16 @@ end
 BAD_SECRET_MSG = "false: bad secret"
 
 
+# The String that should be returned to callers if they attempt to add or remove
+# AppServers from an HAProxy config file at a node where HAProxy is not running.
+NO_HAPROXY_PRESENT = "false: haproxy not running"
+
+
+# The String that should be returned to callers if they attempt to add
+# AppServers for an app that does not yet have nginx and haproxy set up.
+NOT_READY = "false: not ready yet"
+
+
 # Regular expression to determine if a file is a .tar.gz file.
 TAR_GZ_REGEX = /\.tar\.gz$/
 
@@ -464,8 +474,6 @@ class Djinn
     @kill_sig_received = false
     @done_initializing = false
     @done_loading = false
-    @nginx_port = Nginx::START_PORT
-    @haproxy_port = HAProxy::START_PORT
     @userappserver_public_ip = "not-up-yet"
     @userappserver_private_ip = "not-up-yet"
     @state = "AppController just started"
@@ -634,17 +642,11 @@ class Djinn
     if my_node.is_login?
       static_handlers = HelperFunctions.parse_static_data(appid)
       Nginx.write_fullproxy_app_config(appid, http_port, https_port, my_public,
-        my_private, proxy_port, static_handlers, login_ip, get_all_appengine_nodes())
+        my_private, proxy_port, static_handlers, login_ip)
     end
 
     Djinn.log_debug("Done writing new nginx config files!")
     Nginx.reload()
-
-    # Once we've relocated the app, we need to tell the XMPPReceiver about the
-    # app's new location.
-    app_language = @app_info_map[appid]['language']
-    stop_xmpp_for_app(appid)
-    start_xmpp_for_app(appid, http_port, app_language)
 
     # Same for any cron jobs the user has set up.
     # TODO(cgb): We do this on the login node, but the cron jobs are initially
@@ -654,24 +656,30 @@ class Djinn
     # TODO(cgb): This doesn't remove the old cron jobs that were accessing the
     # previously used port. This isn't a problem if nothing else runs on that
     # port, or if anything else there.
-    CronHelper.update_cron(my_public, http_port, app_language, appid)
+    CronHelper.update_cron(my_public, http_port,
+      @app_info_map[appid]['language'], appid)
 
     # Finally, the AppServer takes in the port to send Task Queue tasks to
     # from a file. Update the file and restart the AppServers so they see
     # the new port. Do this in a separate thread to avoid blocking the caller.
+    port_file = "/etc/appscale/port-#{appid}.txt"
+    HelperFunctions.write_file(port_file, http_port)
+
     Thread.new {
-      port_file = "/etc/appscale/port-#{appid}.txt"
-      HelperFunctions.write_file(port_file, http_port)
       @nodes.each { |node|
-        next if not node.is_appengine?
         if node.private_ip != my_node.private_ip
           HelperFunctions.scp_file(port_file, port_file, node.private_ip,
             node.ssh_key)
         end
+        next if not node.is_appengine?
         app_manager = AppManagerClient.new(node.private_ip)
         app_manager.restart_app_instances_for_app(appid)
       }
     }
+
+    # Once we've relocated the app, we need to tell the XMPPReceiver about the
+    # app's new location.
+    MonitInterface.restart("xmpp-#{appid}")
 
     return "OK"
   end
@@ -1082,7 +1090,7 @@ class Djinn
     end
 
     Thread.new {
-      run_groomer_command = "cd /root/appscale/AppDB && python groomer.py"
+      run_groomer_command = "python /root/appscale/AppDB/groomer.py"
       if my_node.is_db_master?
         Djinn.log_run(run_groomer_command)
       else
@@ -1166,6 +1174,7 @@ class Djinn
         if my_node.is_login?
           Nginx.remove_app(app_name)
           Nginx.reload
+          HAProxy.remove_app(app_name)
         end
 
         if my_node.is_appengine?
@@ -1177,7 +1186,6 @@ class Djinn
             Djinn.log_info("(stop_app) AppManager shut down app #{app_name}")
           end
 
-          HAProxy.remove_app(app_name)
           ZKInterface.remove_app_entry(app_name, my_node.public_ip)
         end
 
@@ -1385,9 +1393,11 @@ class Djinn
       # TODO: consider only calling this if new apps are found
       start_appengine
       restart_appengine_apps
-      scale_appservers_on_this_node
-      scale_appservers_across_nodes
-      send_instance_info_to_dashboard
+      if my_node.is_login?
+        scale_appservers_within_nodes
+        scale_appservers_across_nodes
+        send_instance_info_to_dashboard
+      end
       Kernel.sleep(20)
     end
   end
@@ -2194,6 +2204,94 @@ class Djinn
   end
 
 
+  # Instructs HAProxy to begin routing traffic for the named application to
+  # a new AppServer, at the given location.
+  #
+  # This method should be called at the AppController running the login role,
+  # as it is the only node that runs haproxy.
+  #
+  # Args:
+  #   app_id: A String that identifies the application that runs the new
+  #     AppServer.
+  #   ip: A String that identifies the private IP address where the new
+  #     AppServer runs.
+  #   port: A Fixnum that identifies the port where the new AppServer runs at
+  #     ip.
+  #   secret: A String that is used to authenticate the caller.
+  #
+  # Returns:
+  #   "OK" if the addition was successful. In case of failures, the following
+  #   Strings may be returned:
+  #   - BAD_SECRET_MSG: If the caller cannot be authenticated.
+  #   - NO_HAPROXY_PRESENT: If this node does not run HAProxy (and thus cannot
+  #     add AppServers to HAProxy config files).
+  #   - NOT_READY: If this node runs HAProxy, but hasn't allocated ports for
+  #     it and nginx yet. Callers should retry at a later time.
+  def add_appserver_to_haproxy(app_id, ip, port, secret)
+    if !valid_secret?(secret)
+      return BAD_SECRET_MSG
+    end
+
+    if !my_node.is_login?
+      return NO_HAPROXY_PRESENT
+    end
+
+    if @app_info_map[app_id].nil? or @app_info_map[app_id]['appengine'].nil?
+      return NOT_READY
+    end
+
+    Djinn.log_debug("Adding AppServer for app #{app_id} at #{ip}:#{port}")
+    get_scaling_info_for_app(app_id)
+    @app_info_map[app_id]['appengine'] << "#{ip}:#{port}"
+    HAProxy.update_app_config(my_node.private_ip, app_id,
+      @app_info_map[app_id])
+    get_scaling_info_for_app(app_id, update_dashboard=false)
+
+    return "OK"
+  end
+
+
+  # Instructs HAProxy to stop routing traffic for the named application to
+  # the AppServer at the given location.
+  #
+  # This method should be called at the AppController running the login role,
+  # as it is the only node that runs haproxy.
+  #
+  # Args:
+  #   app_id: A String that identifies the application that runs the AppServer
+  #     to remove.
+  #   ip: A String that identifies the private IP address where the AppServer
+  #     to remove runs.
+  #   port: A Fixnum that identifies the port where the AppServer was running
+  #     at ip.
+  #   secret: A String that is used to authenticate the caller.
+  #
+  # Returns:
+  #   "OK" if the removal was successful. In case of failures, the following
+  #   Strings may be returned:
+  #   - BAD_SECRET_MSG: If the caller cannot be authenticated.
+  #   - NO_HAPROXY_PRESENT: If this node does not run HAProxy (and thus cannot
+  #     remove AppServers from HAProxy config files).
+  def remove_appserver_from_haproxy(app_id, ip, port, secret)
+    if !valid_secret?(secret)
+      return BAD_SECRET_MSG
+    end
+
+    if !my_node.is_login?
+      return NO_HAPROXY_PRESENT
+    end
+
+    Djinn.log_debug("Removing AppServer for app #{app_id} at #{ip}:#{port}")
+    get_scaling_info_for_app(app_id)
+    @app_info_map[app_id]['appengine'].delete("#{ip}:#{port}")
+    HAProxy.update_app_config(my_node.private_ip, app_id,
+      @app_info_map[app_id])
+    get_scaling_info_for_app(app_id, update_dashboard=false)
+
+    return "OK"
+  end
+
+
   def write_database_info()
     table = @creds["table"]
     replication = @creds["replication"]
@@ -2348,8 +2446,6 @@ class Djinn
 
     # Similarly, if the machine was halted, then no App Engine apps are
     # running, so we need to start them all back up again.
-    json_state['@nginx_port'] = Nginx::START_PORT
-    json_state['@haproxy_port'] = HAProxy::START_PORT
     json_state['@apps_loaded'] = []
 
     return json_state
@@ -2543,11 +2639,12 @@ class Djinn
       instance_info = []
       @app_info_map.each_pair { |appid, app_info|
         next if app_info['appengine'].nil?
-        app_info['appengine'].each { |port|
+        app_info['appengine'].each { |location|
+          host, port = location.split(":")
           instance_info << {
             'appid' => appid,
-            'host' => my_node.public_ip,
-            'port' => port,
+            'host' => host,
+            'port' => Integer(port),
             'language' => app_info['language']
           }
         }
@@ -2581,35 +2678,33 @@ class Djinn
   #
   # Args:
   #   appid: A String that names the application whose AppServer was removed.
-  #   port: An Integer that identifies the port that the AppServer was removed
-  #     off of. We don't pass in the corresponding IP address or FQDN because we
-  #     assume it was on this machine.
-  def delete_instance_from_dashboard(appid, port)
-    APPS_LOCK.synchronize {
-      begin
-        instance_info = [{
-          'appid' => appid,
-          'host' => my_node.public_ip,
-          'port' => port
-        }]
+  #   location: A String that identifies the host and port that the AppServer
+  #     was removed off of. 
+  def delete_instance_from_dashboard(appid, location)
+    begin
+      host, port = location.split(":")
+      instance_info = [{
+        'appid' => appid,
+        'host' => host,
+        'port' => Integer(port)
+      }]
 
-        url = URI.parse("https://#{get_login.public_ip}:" +
-          "#{AppDashboard::LISTEN_SSL_PORT}/apps/stats/instances")
-        http = Net::HTTP.new(url.host, url.port)
-        http.use_ssl = true
-        request = Net::HTTP::Delete.new(url.path)
-        request.body = JSON.dump(instance_info)
-        response = http.request(request)
-        Djinn.log_debug("Done sending instance info to AppDashboard!")
-        Djinn.log_debug("Instance info is: #{instance_info.inspect}")
-        Djinn.log_debug("Response is #{response.body}")
-      rescue Exception => exception
-        # Don't crash the AppController because we weren't able to send over
-        # the instance info - just continue on.
-        Djinn.log_warn("Couldn't delete instance info to AppDashboard because" +
-          " of a #{exception.class} exception.")
-      end
-    }
+      url = URI.parse("https://#{get_login.public_ip}:" +
+        "#{AppDashboard::LISTEN_SSL_PORT}/apps/stats/instances")
+      http = Net::HTTP.new(url.host, url.port)
+      http.use_ssl = true
+      request = Net::HTTP::Delete.new(url.path)
+      request.body = JSON.dump(instance_info)
+      response = http.request(request)
+      Djinn.log_debug("Done sending instance info to AppDashboard!")
+      Djinn.log_debug("Instance info is: #{instance_info.inspect}")
+      Djinn.log_debug("Response is #{response.body}")
+    rescue Exception => exception
+      # Don't crash the AppController because we weren't able to send over
+      # the instance info - just continue on.
+      Djinn.log_warn("Couldn't delete instance info to AppDashboard because" +
+        " of a #{exception.class} exception.")
+    end
   end
 
 
@@ -2970,7 +3065,7 @@ class Djinn
         'nginx' => ApiChecker::SERVER_PORT,
         'nginx_https' => Nginx.get_ssl_port_for_app(ApiChecker::SERVER_PORT),
         'haproxy' => HAProxy.app_listen_port(-1),
-        'appengine' => [19997, 19998, 19999],
+        'appengine' => ["#{apichecker_private_ip}:19999"],
         'language' => 'python27'
       }
     end
@@ -3236,7 +3331,7 @@ class Djinn
     DatastoreServer.start(db_master_ip, @userappserver_private_ip, my_ip, table, zoo_connection)
     HAProxy.create_datastore_server_config(my_node.private_ip, DatastoreServer::PROXY_PORT, table)
     Nginx.create_datastore_server_config(my_node.private_ip, DatastoreServer::PROXY_PORT)
-    Nginx.restart()
+    Nginx.reload()
 
     # TODO check the return value
     DatastoreServer.is_running(my_ip)
@@ -3624,8 +3719,7 @@ class Djinn
 
       static_handlers = HelperFunctions.parse_static_data(app)
       Nginx.write_fullproxy_app_config(app, http_port, https_port,
-        my_public, my_private, proxy_port, static_handlers, login_ip,
-        get_all_appengine_nodes())
+        my_public, my_private, proxy_port, static_handlers, login_ip)
     }
     Djinn.log_debug("Done writing new nginx config files!")
     Nginx.reload()
@@ -3842,12 +3936,13 @@ class Djinn
     Nginx.create_app_load_balancer_config(my_public, my_private, 
       AppDashboard::PROXY_PORT)
     HAProxy.start
-    Nginx.restart
+    Nginx.reload
     @app_info_map[AppDashboard::APP_NAME] = {
       'nginx' => 1080,
       'nginx_https' => 1443,
       'haproxy' => AppDashboard::PROXY_PORT,
-      'appengine' => [8000, 8001, 8002],
+      'appengine' => ["#{my_private}:8000", "#{my_private}:8001",
+        "#{my_private}:8002"],
       'language' => 'python27'
     }
   end
@@ -3940,6 +4035,7 @@ class Djinn
   #   is_new_app: true if the application to start has never run on this node
   #     before, and false if it has (e.g., we're loading new code for this app).
   def setup_appengine_application(app, is_new_app)
+    initialize_scaling_info_for_app(app)
     uac = UserAppClient.new(@userappserver_private_ip, @@secret)
     app_data = uac.get_app_data(app)
     loop {
@@ -3991,9 +4087,16 @@ class Djinn
       maybe_start_taskqueue_worker(app)
     end
 
-    if is_new_app and @app_info_map[app]['nginx'].nil?
-      @app_info_map[app]['nginx'], @app_info_map[app]['haproxy'] = get_nginx_and_haproxy_ports()
-      @app_info_map[app]['nginx_https'] = Nginx.get_ssl_port_for_app(@app_info_map[app]['nginx'])
+    if is_new_app
+      if @app_info_map[app]['nginx'].nil?
+        @app_info_map[app]['nginx'] = find_lowest_free_port(Nginx::START_PORT)
+        @app_info_map[app]['haproxy'] = find_lowest_free_port(
+          HAProxy::START_PORT)
+        @app_info_map[app]['nginx_https'] = Nginx.get_ssl_port_for_app(
+          @app_info_map[app]['nginx'])
+      end
+
+      @app_info_map[app]['appengine'] = []
     end
 
     # Only take a new port for this application if there's no data about
@@ -4001,10 +4104,30 @@ class Djinn
     nginx_port = @app_info_map[app]['nginx']
     https_port = @app_info_map[app]['nginx_https']
     proxy_port = @app_info_map[app]['haproxy']
+
     port_file = "/etc/appscale/port-#{app}.txt"
-    HelperFunctions.write_file(port_file, "#{@app_info_map[app]['nginx']}")
-    Djinn.log_debug("App #{app} will be using nginx port #{nginx_port}, " +
-      "https port #{https_port}, and haproxy port #{proxy_port}")
+    if my_node.is_login?
+      HelperFunctions.write_file(port_file, "#{@app_info_map[app]['nginx']}")
+      Djinn.log_debug("App #{app} will be using nginx port #{nginx_port}, " +
+        "https port #{https_port}, and haproxy port #{proxy_port}")
+
+      @nodes.each { |node|
+        if node.private_ip != my_node.private_ip
+          HelperFunctions.scp_file(port_file, port_file, node.private_ip,
+            node.ssh_key)
+        end
+      }
+    else
+      loop {
+        if File.exists?(port_file)
+          Djinn.log_debug("Got port file for app #{app}")
+          break
+        else
+          Djinn.log_debug("Waiting for port file for app #{app}")
+          Kernel.sleep(5)
+        end
+      }
+    end
 
     # TODO(cgb): Make sure we don't add the same cron lines in twice for the same
     # app, and only start xmpp if it isn't already started
@@ -4030,8 +4153,7 @@ class Djinn
       end
 
       Nginx.write_fullproxy_app_config(app, nginx_port, https_port, my_public,
-        my_private, proxy_port, static_handlers, login_ip,
-        get_all_appengine_nodes())
+        my_private, proxy_port, static_handlers, login_ip)
 
       loop {
         Kernel.sleep(5)
@@ -4057,32 +4179,43 @@ class Djinn
       # TODO(cgb): What happens if the user updates their env vars between app
       # deploys?
       if is_new_app
-        @app_info_map[app]['appengine'] = []
         @num_appengines.times { |index|
-          appengine_port = get_appengine_port()
+          appengine_port = find_lowest_free_port(STARTING_APPENGINE_PORT)
           Djinn.log_info("Starting #{app_language} app #{app} on " +
             "#{HelperFunctions.local_ip}:#{appengine_port}")
-          @app_info_map[app]['appengine'] << appengine_port
 
           xmpp_ip = get_login.public_ip
 
           pid = app_manager.start_app(app, appengine_port,
-            get_load_balancer_ip(), nginx_port, app_language, xmpp_ip,
+            get_load_balancer_ip(), app_language, xmpp_ip,
             [Djinn.get_nearest_db_ip()], HelperFunctions.get_app_env_vars(app))
 
           if pid == -1
             place_error_app(app, "ERROR: Unable to start application " + \
                 "#{app}. Please check the application logs.")
           end
+
+          # Tell the AppController at the login node (which runs HAProxy) that a
+          # new AppServer is running.
+          acc = AppControllerClient.new(get_login.private_ip, @@secret)
+          loop {
+            result = acc.add_appserver_to_haproxy(app, my_node.private_ip,
+              appengine_port)
+            if result == NOT_READY
+              Djinn.log_info("Login node is not yet ready for AppServers to " +
+                "be added - trying again momentarily.")
+              Kernel.sleep(5)
+            else
+              Djinn.log_info("Successfully informed login node about new " +
+                "AppServer for #{app} on port #{appengine_port}.")
+              break
+            end
+          }
         }
       else
         Djinn.log_info("Restarting AppServers hosting old version of #{app}")
         result = app_manager.restart_app_instances_for_app(app)
       end
-
-      HAProxy.update_app_config(app, proxy_port,
-        @app_info_map[app]['appengine'], my_private)
-      HAProxy.reload
 
       if is_new_app
         # now doing this at the real end so that the tools will
@@ -4106,133 +4239,34 @@ class Djinn
   end
 
 
-  # Finds the lowest numbered port that is free to serve a new dev_appserver
-  # process.
+  # Finds the lowest numbered port that is free to serve a new process.
   #
   # Callers should make sure to store the port returned by this process in
   # @app_info_map, preferably within the use of the APPS_LOCK (so that a
   # different caller doesn't get the same value).
   #
   # Returns:
-  #   A Fixnum corresponding to the port number that a new dev_appserver can be
-  #   bound to.
-  def get_appengine_port
-    # Grab the APPS_LOCK here since more than one thread could be looking at
-    # the app_info_map (e.g., if an app is being uploaded while another is being
-    # relocated).
-    APPS_LOCK.synchronize {
-      ports_in_use = []
-      @app_info_map.each { |app, info|
-        ports_in_use << info['appengine']
-      }
-
-      ports_in_use.flatten!
-
-      possibly_free_port = STARTING_APPENGINE_PORT
-      loop {
-        if ports_in_use.include?(possibly_free_port)
-          possibly_free_port += 1
-        else
-          Djinn.log_debug("Port #{possibly_free_port} may be available.")
-
-          actually_available = Djinn.log_run("lsof -i:#{possibly_free_port}")
-          if actually_available.empty?
-            Djinn.log_debug("Port #{possibly_free_port} is available for use.")
-            return possibly_free_port
-          else
-            Djinn.log_warn("Port #{possibly_free_port} should have been free " +
-              "but is actually in use by [#{actually_available}], so skipping" +
-              " this port.")
-            possibly_free_port += 1
-          end
-        end
-      }
-    }
-  end
-
-
-  # Finds the next available ports that can be used for nginx and haproxy.
-  # Historically, it was safe to use an increasing counter in lieu of this
-  # method, but since apps can be moved between arbitrary ports now, we have to
-  # check that a port we are about to hand out for use is not actually in use by
-  # a different application.
-  #
-  # Returns:
-  #   Two Fixnums, where the first corresponds to a port that is free for use
-  #   with nginx, and the second corresponds to a port that is free for use with
-  #   haproxy.
-  def get_nginx_and_haproxy_ports()
+  #   A Fixnum corresponding to the port number that a new process can be bound
+  #   to.
+  def find_lowest_free_port(starting_port)
+    possibly_free_port = starting_port
     loop {
-      nginx_port_in_use = false
-      @app_info_map.each { |app, info|
-        all_ports_for_app = [info['nginx'], info['nginx_https'],
-          info['haproxy'], info['appengine']].flatten
-
-        if all_ports_for_app.include?(@nginx_port)
-          Djinn.log_debug("Couldn't use port #{@nginx_port} for a new " +
-            "app because #{app} is using it: #{info.inspect}")
-          nginx_port_in_use = true
-          break
-        end
-      }
-
-      if nginx_port_in_use
-        if @nginx_port == MAX_PORT
-          Djinn.log_warn("Nginx port allocation reached maximum port " +
-            "number #{MAX_PORT}. Resetting back to #{MIN_PORT} in case " +
-            "other ports have freed up.")
-          @nginx_port = MIN_PORT
-        else
-          @nginx_port += 1
-        end
-        Djinn.log_debug("Will consider port #{@nginx_port} for nginx instead.")
+      actually_available = Djinn.log_run("lsof -i:#{possibly_free_port}")
+      if actually_available.empty?
+        Djinn.log_debug("Port #{possibly_free_port} is available for use.")
+        return possibly_free_port
       else
-        break
+        Djinn.log_warn("Port #{possibly_free_port} is in use, so skipping it.")
+        possibly_free_port += 1
       end
     }
-
-    loop {
-      haproxy_port_in_use = false
-      @app_info_map.each { |app, info|
-        all_ports_for_app = [info['nginx'], info['nginx_https'],
-          info['haproxy'], info['appengine']].flatten
-
-        if all_ports_for_app.include?(@haproxy_port)
-          Djinn.log_debug("Couldn't use port #{@haproxy_port} for a new " +
-            "app because it was in the list #{info.inspect}")
-          haproxy_port_in_use = true
-          break
-        end
-      }
-
-      if haproxy_port_in_use
-        if @haproxy_port == MAX_PORT
-          Djinn.log_warn("Haproxy port allocation reached maximum port " +
-            "number #{MAX_PORT}. Resetting back to #{MIN_PORT} in case " +
-            "other ports have freed up.")
-          @haproxy_port = MIN_PORT + 1
-        else
-          @haproxy_port += 1
-        end
-        Djinn.log_debug("Will consider port #{@haproxy_port} for " +
-          "haproxy instead.")
-      else
-        break
-      end
-    }
-
-    return @nginx_port, @haproxy_port
   end
 
 
   # This method guards access to perform_scaling_for_appservers so that only 
   # one thread call it at a time. We also only perform scaling if the user 
   # wants us to, and simply return otherwise.
-  def scale_appservers_on_this_node
-    if !my_node.is_appengine?
-      return
-    end
-
+  def scale_appservers_within_nodes
     if @creds["autoscale"].downcase == "true"
       perform_scaling_for_appservers()
     end
@@ -4296,17 +4330,24 @@ class Djinn
   # and how many requests are served at a given time. Based on this information,
   # this method reports whether or not AppServers should be added, removed, or
   # if no changes are needed.
-  def get_scaling_info_for_app(app_name)
+  def get_scaling_info_for_app(app_name, update_dashboard=true)
     Djinn.log_debug("Getting scaling info for application #{app_name}")
-  
-    # Now see how many requests came in for our app and how many are enqueued
-    monitor_cmd = "echo \"show info;show stat\" | " +
-      "socat stdio unix-connect:/etc/haproxy/stats | grep #{app_name}"
 
     total_requests_seen = 0
     total_req_in_queue = 0
     time_requests_were_seen = 0
-    Djinn.log_run(monitor_cmd).each { |line|
+
+    # Now see how many requests came in for our app and how many are enqueued
+    monitoring_info = Djinn.log_run("echo \"show info;show stat\" | " +
+      "socat stdio unix-connect:/etc/haproxy/stats | grep #{app_name}")
+
+    if monitoring_info.empty?
+      Djinn.log_warn("Didn't see any monitoring info - #{app_name} may not " +
+        "be running.")
+      return :no_change
+    end
+
+    monitoring_info.each { |line|
       parsed_info = line.split(',')
       if parsed_info.length < TOTAL_REQUEST_RATE_INDEX  # no request info here
         next
@@ -4333,7 +4374,8 @@ class Djinn
       return :no_change
     end
 
-    update_request_info(app_name, total_requests_seen, time_requests_were_seen)
+    update_request_info(app_name, total_requests_seen, time_requests_were_seen,
+      update_dashboard)
 
     if total_req_in_queue.zero?
       Djinn.log_debug("No requests are enqueued for app #{app_name} - " +
@@ -4366,7 +4408,10 @@ class Djinn
   #     occurs when we start the app or add/remove AppServers).
   #   time_requests_were_seen: An Integer that represents the epoch time when we
   #     got request info from haproxy.
-  def update_request_info(app_name, total_requests_seen, time_requests_were_seen)
+  def update_request_info(app_name, total_requests_seen,
+    time_requests_were_seen, update_dashboard)
+    Djinn.log_debug("Time now is #{time_requests_were_seen}, last " +
+      "time was #{@last_sampling_time[app_name]}")
     Djinn.log_debug("Total requests seen now is #{total_requests_seen}, last " +
       "time was #{@total_req_rate[app_name]}")
     requests_since_last_sampling = total_requests_seen - @total_req_rate[app_name]
@@ -4383,8 +4428,11 @@ class Djinn
       return
     end
 
-    send_request_info_to_dashboard(app_name, time_requests_were_seen,
-      average_request_rate)
+    if update_dashboard
+      send_request_info_to_dashboard(app_name, time_requests_were_seen,
+        average_request_rate)
+    end
+
     Djinn.log_debug("Total requests will be set to #{total_requests_seen} " +
       "for app #{app_name}, with last sampling time #{time_requests_were_seen}")
     @total_req_rate[app_name] = total_requests_seen
@@ -4400,19 +4448,50 @@ class Djinn
       return
     end
 
-    appservers_running = @app_info_map[app_name]['appengine'].length
+    # See how many AppServers are running on each machine.
+    appservers_running = {}
+    @app_info_map[app_name]['appengine'].each { |location|
+      host, port = location.split(":")
+      if appservers_running[host].nil?
+        appservers_running[host] = []
+      end
+      appservers_running[host] << port
+    }
 
-    if appservers_running >= MAX_APPSERVERS_ON_THIS_NODE
+    # Add an AppServer on the machine with the lowest number of AppServers
+    # running.
+    appserver_to_use = appservers_running.keys[0]
+    lowest_appserver_ports = appservers_running.values[0].length
+    Djinn.log_debug("Considering adding an AppServer to host " +
+      "#{appserver_to_use}, as it runs #{lowest_appserver_ports} AppServers.")
+    appservers_running.each { |host, ports|
+      if ports.length < lowest_appserver_ports and ports.length < MAX_APPSERVERS_ON_THIS_NODE
+        appserver_to_use = host
+        lowest_appserver_ports = ports.length
+        Djinn.log_debug("Instead considering adding an AppServer to host " +
+          "#{appserver_to_use}, as it runs #{lowest_appserver_ports} " +
+          "AppServers.")
+      end
+    }
+
+    # Only add an AppServer there if there's room available.
+    Djinn.log_debug("The machine running the lowest number of AppServers is " +
+      "#{appserver_to_use}, running #{lowest_appserver_ports} AppServers.")
+    if lowest_appserver_ports >= MAX_APPSERVERS_ON_THIS_NODE
       Djinn.log_info("The maximum number of AppServers for this app " +
-        "are already running, so don't add any more on this machine.")
-      ZKInterface.request_scale_up_for_app(app_name, my_node.private_ip)
+        "are already running on all machines, so requesting a new machine.")
+    else
+      Djinn.log_info("Adding a new AppServer on #{appserver_to_use} for #{app_name}")
+      acc = AppControllerClient.new(appserver_to_use, @@secret)
+      acc.add_appserver_process(app_name)
+      @last_decision[app_name] = Time.now.to_i
       return
     end
 
-    Djinn.log_info("Adding a new AppServer on this node for #{app_name}")
-    add_appserver_process(app_name)
-    initialize_scaling_info_for_app(app_name, force=true)
-    @last_decision[app_name] = Time.now.to_i
+    # If we're this far, no room is available for AppServers, so try to add a
+    # new node instead.
+    ZKInterface.request_scale_up_for_app(app_name, my_node.private_ip)
+    return
   end
 
 
@@ -4424,19 +4503,51 @@ class Djinn
       return
     end
 
-    appservers_running = @app_info_map[app_name]['appengine'].length
+    # See how many AppServers are running on each machine.
+    appservers_running = {}
+    @app_info_map[app_name]['appengine'].each { |location|
+      host, port = location.split(":")
+      if appservers_running[host].nil?
+        appservers_running[host] = []
+      end
+      appservers_running[host] << port
+    }
 
-    if appservers_running <= MIN_APPSERVERS_ON_THIS_NODE
+    # Add an AppServer on the machine with the highest number of AppServers
+    # running.
+    appserver_to_use = appservers_running.keys[0]
+    highest_appserver_ports = appservers_running.values[0].length
+    Djinn.log_debug("Considering removing an AppServer from host " +
+      "#{appserver_to_use}, as it runs #{highest_appserver_ports} AppServers.")
+    appservers_running.each { |host, ports|
+      if ports.length > highest_appserver_ports and ports.length > MIN_APPSERVERS_ON_THIS_NODE
+        appserver_to_use = host
+        highest_appserver_ports = ports.length
+        Djinn.log_debug("Instead considering removing an AppServer from host " +
+          "#{appserver_to_use}, as it runs #{highest_appserver_ports} " +
+          "AppServers.")
+      end
+    }
+
+    # Only remove an AppServer there if it's not the last AppServer.
+    Djinn.log_debug("The machine running the highest number of AppServers is " +
+      "#{appserver_to_use}, running #{highest_appserver_ports} AppServers.")
+    if highest_appserver_ports <= MIN_APPSERVERS_ON_THIS_NODE
       Djinn.log_debug("The minimum number of AppServers for this app " +
-        "are already running, so don't remove any more off this machine.")
-      ZKInterface.request_scale_down_for_app(app_name, my_node.private_ip)
+        "are already running on all machines, so requesting less machines.")
+    else
+      ports = appservers_running[appserver_to_use]
+      port = ports[rand(ports.length)]
+      Djinn.log_info("Removing a new AppServer from #{appserver_to_use} for #{app_name}")
+      acc = AppControllerClient.new(appserver_to_use, @@secret)
+      acc.remove_appserver_process(app_name, port)
+      @last_decision[app_name] = Time.now.to_i
       return
     end
 
-    Djinn.log_info("Removing an AppServer on this node for #{app_name}")
-    remove_appserver_process(app_name)
-    initialize_scaling_info_for_app(app_name, force=true)
-    @last_decision[app_name] = Time.now.to_i
+    # If we're this far, nobody can scale down, so try to remove a node instead.
+    ZKInterface.request_scale_down_for_app(app_name, my_node.private_ip)
+    return
   end
 
 
@@ -4445,10 +4556,16 @@ class Djinn
   # this somehow
   #
   # Args:
-  #   app: Name of the application for which we're adding a process instance
-  #
-  def add_appserver_process(app)
+  #   app_id: A String naming the application that an additional instance will
+  #     be added for.
+  #   secret: A String that is used to authenticate the caller.
+  def add_appserver_process(app_id, secret)
+    if !valid_secret?(secret)
+      return BAD_SECRET_MSG
+    end
+
     # Starting a appserver instance on request to scale the application 
+    app = app_id
     @state = "Adding an AppServer for #{app}"
 
     uac = UserAppClient.new(@userappserver_private_ip, @@secret)
@@ -4480,44 +4597,41 @@ class Djinn
       return  
     end
 
-    nginx_port = @app_info_map[app]['nginx']
-    haproxy_port = @app_info_map[app]['haproxy']
-
-    appengine_port = get_appengine_port()
-    @app_info_map[app]['appengine'] << appengine_port
-
-    my_private = my_node.private_ip
-    Djinn.log_debug("This app will be running on ports: " +
-      "#{@app_info_map[app]['appengine']}")
-    HAProxy.update_app_config(app, haproxy_port,
-      @app_info_map[app]['appengine'], my_private)
-
+    appengine_port = find_lowest_free_port(STARTING_APPENGINE_PORT)
     Djinn.log_debug("Adding #{app_language} app #{app} on " +
       "#{HelperFunctions.local_ip}:#{appengine_port} ")
 
     xmpp_ip = get_login.public_ip
 
     result = app_manager.start_app(app, appengine_port, get_load_balancer_ip(),
-      nginx_port, app_language, xmpp_ip, [Djinn.get_nearest_db_ip()],
+      app_language, xmpp_ip, [Djinn.get_nearest_db_ip()],
       HelperFunctions.get_app_env_vars(app))
 
     if result == -1
       Djinn.log_error("ERROR: Unable to start application #{app} on port " +
         "#{appengine_port}.")
-      next
     end
 
-    HAProxy.reload
+    # Tell the AppController at the login node (which runs HAProxy) that a new
+    # AppServer is running.
+    acc = AppControllerClient.new(get_login.private_ip, @@secret)
+    acc.add_appserver_to_haproxy(app, my_node.private_ip, appengine_port)
   end
 
 
   # Terminates a random AppServer that hosts the specified App Engine app.
   #
   # Args:
-  #   app: The name of the application for which we're removing a 
-  #        process instance
-  #
-  def remove_appserver_process(app)
+  #   app_id: A String naming the application that a process will be removed
+  #     from.
+  #   port: A Fixnum that names the port of the AppServer to remove.
+  #   secret: A String that is used to authenticate the caller.
+  def remove_appserver_process(app_id, port, secret)
+    if !valid_secret?(secret)
+      return BAD_SECRET_MSG
+    end
+
+    app = app_id
     @state = "Stopping an AppServer to free unused resources"
     Djinn.log_debug("Deleting appserver instance to free up unused resources")
 
@@ -4538,24 +4652,17 @@ class Djinn
       return
     end
 
-    # Select a random AppServer to kill.
-    ports = @app_info_map[app]['appengine']
-    port = ports[rand(ports.length)]
-
     if !app_manager.stop_app_instance(app, port)
       Djinn.log_error("Unable to stop instance on port #{port} app #{app_name}")
     end
 
-    # Delete the port number from the app_info_map
-    @app_info_map[app]['appengine'].delete(port)
-
-    haproxy_port = @app_info_map[app]['haproxy']
-    HAProxy.update_app_config(app, haproxy_port,
-      @app_info_map[app]['appengine'], my_private)
-    HAProxy.reload
+    # Tell the AppController at the login node (which runs HAProxy) that this
+    # AppServer isn't running anymore.
+    acc = AppControllerClient.new(get_login.private_ip, @@secret)
+    acc.remove_appserver_from_haproxy(app, my_node.private_ip, port)
 
     # And tell the AppDashboard that the AppServer has been killed.
-    delete_instance_from_dashboard(app, port)
+    delete_instance_from_dashboard(app, "#{my_node.private_ip}:#{port}")
   end 
  
 
@@ -4617,13 +4724,10 @@ class Djinn
       scale_up_requests = scaling_requests.select { |item| item == "scale_up" }
       num_of_scale_up_requests = scale_up_requests.length
 
-      # Spawn an additional node if (1) more than one node is receiving too much
-      # web traffic, or (2) there's only one node, and it's receiving too much
-      # web traffic.
-      if num_of_scale_up_requests > 1 or (num_of_scale_up_requests > 0 and 
-        num_of_appservers == 1)
-        Djinn.log_info("Nodes at #{scale_up_requests.join(' and ')} have " + 
-          "requested more AppServers for app #{appid}, so adding a node.")
+      # Spawn an additional node if the login node requests it.
+      if num_of_scale_up_requests > 0
+        Djinn.log_debug("Login node is requesting more AppServers for app " +
+          "#{appid}, so adding a node.")
         nodes_needed << ["memcache", "taskqueue_slave", "appengine"]
       end
     }
@@ -4695,9 +4799,9 @@ class Djinn
     scale_down_threshold_reached = false
     @apps_loaded.each { |appid|
       scale_downs = all_scaling_votes[appid].select { |vote| vote == "scale_down" }
-      if scale_downs.length > 1
-        Djinn.log_info("Got #{scale_downs.length} votes to scale down app " +
-          "#{appid}, so considering removing VMs.")
+      if scale_downs.length > 0
+        Djinn.log_info("Got a vote to scale down app #{appid}, so " +
+          "considering removing VMs.")
         scale_down_threshold_reached = true
       end
     }
@@ -4732,6 +4836,21 @@ class Djinn
 
     remove_app_hosting_data_for_node(node_to_remove.public_ip)
     remove_node_from_local_and_zookeeper(node_to_remove.public_ip)
+
+    @app_info_map.each { |app_id, info|
+      if info['appengine'].nil?
+        next
+      end
+
+      info['appengine'].each { |location|
+        host, port = location.split(":")
+        if host == node_to_remove.private_ip
+          remove_appserver_from_haproxy(app_id, host, port, @@secret)
+          delete_instance_from_dashboard(app_id, "#{host}:#{port}")
+        end
+      }
+    }
+
     imc = InfrastructureManagerClient.new(@@secret)
     imc.terminate_instances(@creds, node_to_remove.instance_id)
     regenerate_nginx_config_files()
@@ -4820,8 +4939,9 @@ class Djinn
     Djinn.log_debug("Created user [#{xmpp_user}] with password [#{@@secret}] and hashed password [#{xmpp_pass}]")
 
     if Ejabberd.does_app_need_receive?(app, app_language)
-      start_cmd = "#{PYTHON27} #{APPSCALE_HOME}/XMPPReceiver/xmpp_receiver.py #{app} #{login_ip} #{port} #{@@secret}"
-      stop_cmd = "/bin/ps ax | grep '#{start_cmd}' | grep -v grep | awk '{print $1}' | xargs -d '\n' kill -9"
+      start_cmd = "#{PYTHON27} #{APPSCALE_HOME}/XMPPReceiver/xmpp_receiver.py #{app} #{login_ip} #{@@secret}"
+      stop_cmd = "/usr/bin/python /root/appscale/stop_service.py " +
+        "xmpp_receiver.py #{app}"
       watch_name = "xmpp-#{app}"
       MonitInterface.start(watch_name, start_cmd, stop_cmd, 9999)
       Djinn.log_debug("App #{app} does need xmpp receive functionality")
@@ -4847,4 +4967,5 @@ class Djinn
   def stop_open
     return
   end
+
 end
