@@ -31,7 +31,12 @@ increaseconnections()
     echo "net.ipv4.netfilter.ip_conntrack_max = 196608" >> /etc/sysctl.conf
     echo "net.netfilter.nf_conntrack_max = 262144" >> /etc/sysctl.conf
     echo "net.core.somaxconn = 20240" >> /etc/sysctl.conf
+
+    # Docker doesn't support the above config options, so it's ok if the
+    # sysctl command fails.
+    set +e
     /sbin/sysctl -p /etc/sysctl.conf 
+    set -e
 }
 
 setupntpcron()
