@@ -117,20 +117,21 @@ class AppControllerClient
         Kernel.sleep(1)
         retry
       end
-    rescue Timeout::Error
-      return false if ok_to_fail
-      retry
+    #rescue Timeout::Error
+    #  return false if ok_to_fail
+    #  retry
     rescue OpenSSL::SSL::SSLError, NotImplementedError, Errno::EPIPE, Errno::ECONNRESET, SOAP::EmptyResponseError
       retry
     rescue Exception => except
-      if retry_on_except
-        retry
-      else
-        trace = except.backtrace.join("\n")
-        HelperFunctions.log_and_crash("[#{callr}] We saw an unexpected error" +
-          " of the type #{except.class} with the following message:\n" +
-          "#{except}, with trace: #{trace}")
-      end
+      return
+    #  if retry_on_except
+    #    retry
+    #  else
+    #    trace = except.backtrace.join("\n")
+    #    HelperFunctions.log_and_crash("[#{callr}] We saw an unexpected error" +
+    #      " of the type #{except.class} with the following message:\n" +
+    #      "#{except}, with trace: #{trace}")
+    #  end
     end
   end
 
