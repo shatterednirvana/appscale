@@ -163,7 +163,7 @@ EOF
     mkdir -pv /var/log/appscale
     mkdir -pv /var/appscale/
 
-    mkdir /var/run/sshd
+    mkdir -pv /var/run/sshd
     chmod 0755 /var/run/sshd
 }
 
