@@ -377,11 +377,11 @@ class AppDashboardHelper():
         # tell the user to check in later to see if the app uploaded
         # successfully.
         start = datetime.datetime.now()
-        end = start + datetime.timedelta(0, 45)
+        end = start + datetime.timedelta(0, 5)
         while True:
           if datetime.datetime.now() > end:
-            raise AppHelperException("App upload is taking a while. Please " +
-              "wait for the application to start running.")
+            return "App upload is taking a while. Please wait for the " + \
+              "application to start running."
 
           status = acc.get_app_upload_status(upload_info['reservation_id'])
           if status == "starting":
