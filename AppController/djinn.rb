@@ -958,11 +958,17 @@ class Djinn
     Djinn.log_debug("Received a request to upload app at #{archived_file}, with suffix #{file_suffix}, with admin user #{email}.")
 
     Thread.new {
-      if !archived_file.match(/#{file_suffix}$/)
-        archived_file_old = archived_file
-        archived_file = "#{archived_file_old}.#{file_suffix}"
-        Djinn.log_debug("Renaming #{archived_file_old} to #{archived_file}")
-        File.rename(archived_file_old, archived_file)
+      if file_suffix == "git"
+        app_location = "/tmp/apps-#{HelperFunctions.get_random_alphanumeric()}"
+        Djinn.log_run("git clone #{archived_file} #{app_location}")
+        archived_file = app_location
+      else
+        if !archived_file.match(/#{file_suffix}$/)
+          archived_file_old = archived_file
+          archived_file = "#{archived_file_old}.#{file_suffix}"
+          Djinn.log_debug("Renaming #{archived_file_old} to #{archived_file}")
+          File.rename(archived_file_old, archived_file)
+        end
       end
 
       Djinn.log_debug("Uploading file at location #{archived_file}")

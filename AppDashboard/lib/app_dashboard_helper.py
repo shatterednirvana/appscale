@@ -361,6 +361,16 @@ class AppDashboardHelper():
         "{0}".format(failure_message))
 
 
+  def upload_app_via_git_url(self, git_url):
+    user = users.get_current_user()
+    if not user:
+      raise AppHelperException("There was an error uploading your " \
+        "application. You must be logged in to upload applications.")
+    acc = self.get_appcontroller_client()
+    upload_info = acc.upload_app(git_url, 'git', user.email())
+    return "Your app is uploading!"
+
+
   def delete_app(self, appname):
     """ Removes a Google App Engine application from this AppScale deployment.
 
